@@ -1,0 +1,36 @@
+# Build outputs
+nheqminer/build/
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.exp
+
+# vcpkg (installed separately)
+/vcpkg/
+
+# Logs
+*.log
+pool_test*.log
+
+# Autotune results (machine-specific)
+autotune_results.md
+benchmark_results.md
+
+# IDE
+.vs/
+.vscode/
+*.suo
+*.user
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Downloaded installers
+*.exe.download
+
+# Claude internal
+.claude/
