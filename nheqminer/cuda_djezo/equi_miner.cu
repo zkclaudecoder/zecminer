@@ -2192,6 +2192,137 @@ __host__ void eq_cuda_context<RB, SM, SSM, THREADS, PACKER>::solve(const char *t
 				(unsigned long long)nonempty);
 	}
 
+	// EQUI_DUMP_SETXOR: per-round set-XOR of all valid slot contents. Because
+	// atomicAdd ordering randomizes slot positions, the set (not the sequence)
+	// is the invariant. XOR is order-independent so this gives a stable
+	// byte-level signature we can compare against cuda_blackwell.
+	static const bool dump_setxor = std::getenv("EQUI_DUMP_SETXOR") != nullptr;
+	if (dump_setxor) {
+		cudaDeviceSynchronize();
+		constexpr u32 NB = 1u << (DIGITBITS - RB);
+
+		u32 hnslots[8][NB];
+		for (int r = 1; r <= 7; ++r)
+			cudaMemcpy(hnslots[r], &device_eq->edata.nslots[r], sizeof(hnslots[r]), cudaMemcpyDeviceToHost);
+		u32 hn8[4096];
+		cudaMemcpy(hn8, &device_eq->edata.nslots8, sizeof(hn8), cudaMemcpyDeviceToHost);
+
+		// round-0: round0trees[4096][RB8_NSLOTS] (slot = 8 u32s); count nslots0[4096]
+		{
+			u32 hn0[4096];
+			cudaMemcpy(hn0, &device_eq->edata.nslots0, sizeof(hn0), cudaMemcpyDeviceToHost);
+			std::vector<slot> buf(4096 * RB8_NSLOTS);
+			cudaMemcpy(buf.data(), &device_eq->round0trees[0][0],
+					   buf.size() * sizeof(slot), cudaMemcpyDeviceToHost);
+			u32 sx[8] = {0};
+			for (u32 b = 0; b < 4096; ++b) {
+				u32 ns = hn0[b]; if (ns > RB8_NSLOTS) ns = RB8_NSLOTS;
+				for (u32 s = 0; s < ns; ++s) {
+					const slot& x = buf[b * RB8_NSLOTS + s];
+					for (int i = 0; i < 8; ++i) sx[i] ^= x.hash[i];
+				}
+			}
+			fprintf(stderr, "[DJEZO] round-0 xor: sl={%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x}\n",
+					sx[0], sx[1], sx[2], sx[3], sx[4], sx[5], sx[6], sx[7]);
+		}
+
+		// round-1: trees[0][NBUCKETS][NSLOTS] (slot = 8 u32s); count nslots[1][NB]
+		// Only XOR buckets safely below NSLOTS (non-overflow) for a stable signature.
+		// hash[6] is pack (order-dependent), hash[7] is always 0.
+		{
+			std::vector<slot> buf(NB * SM);
+			cudaMemcpy(buf.data(), &device_eq->trees[0][0][0],
+					   buf.size() * sizeof(slot), cudaMemcpyDeviceToHost);
+			const u32 safe_cap_r1 = SM - 10;
+			u32 sx[8] = {0};
+			u32 included = 0, overflowed = 0;
+			for (u32 b = 0; b < NB; ++b) {
+				u32 ns = hnslots[1][b];
+				if (ns > safe_cap_r1) { ++overflowed; continue; }
+				++included;
+				for (u32 s = 0; s < ns; ++s) {
+					const slot& x = buf[b * SM + s];
+					for (int i = 0; i < 8; ++i) sx[i] ^= x.hash[i];
+				}
+			}
+			fprintf(stderr, "[DJEZO] round-1 xor(safe %u/%u skip=%u): content=[%08x %08x %08x %08x %08x %08x] pack=%08x z=%08x\n",
+					included, NB, overflowed, sx[0], sx[1], sx[2], sx[3], sx[4], sx[5], sx[6], sx[7]);
+		}
+
+		// round2trees / round3trees: {slotsmall[NSLOTS]; slottiny[NSLOTS];}[NBUCKETS]
+		// Note: slottiny.hash[1] is the pack field (order-dependent); XOR only .hash[0].
+		const size_t r23stride = SM * sizeof(slotsmall) + SM * sizeof(slottiny);
+		const u32 safe_cap = SM - 10;
+		auto xor_r23 = [&](const void* dev_base, int r) {
+			std::vector<uint8_t> buf(NB * r23stride);
+			cudaMemcpy(buf.data(), dev_base, buf.size(), cudaMemcpyDeviceToHost);
+			u32 sx[4] = {0,0,0,0}, tx_content = 0, tx_pack = 0;
+			u32 included = 0, overflowed = 0;
+			for (u32 b = 0; b < NB; ++b) {
+				u32 ns = hnslots[r][b];
+				if (ns > safe_cap) { ++overflowed; continue; }
+				++included;
+				const u32* sm_ptr = (const u32*)(buf.data() + b * r23stride);
+				const u32* tn_ptr = (const u32*)(buf.data() + b * r23stride + SM * sizeof(slotsmall));
+				for (u32 s = 0; s < ns; ++s) {
+					sx[0] ^= sm_ptr[s*4+0]; sx[1] ^= sm_ptr[s*4+1];
+					sx[2] ^= sm_ptr[s*4+2]; sx[3] ^= sm_ptr[s*4+3];
+					tx_content ^= tn_ptr[s*2+0];
+					tx_pack    ^= tn_ptr[s*2+1];
+				}
+			}
+			fprintf(stderr, "[DJEZO] round-%d xor(safe %u/%u skip=%u): sm={%08x,%08x,%08x,%08x} tn_content=%08x tn_pack=%08x\n",
+					r, included, NB, overflowed, sx[0], sx[1], sx[2], sx[3], tx_content, tx_pack);
+		};
+		xor_r23(&device_eq->round2trees[0], 2);
+		xor_r23(&device_eq->round3trees[0], 3);
+
+		// treessmall[4][NBUCKETS][NSLOTS] : rounds 4..7 — all content, no pack.
+		auto xor_sm = [&](int ts_idx, int r) {
+			std::vector<slotsmall> buf(NB * SM);
+			cudaMemcpy(buf.data(), &device_eq->treessmall[ts_idx][0][0],
+					   buf.size() * sizeof(slotsmall), cudaMemcpyDeviceToHost);
+			u32 sx[4] = {0,0,0,0};
+			u32 included = 0, overflowed = 0;
+			for (u32 b = 0; b < NB; ++b) {
+				u32 ns = hnslots[r][b];
+				if (ns > safe_cap) { ++overflowed; continue; }
+				++included;
+				for (u32 s = 0; s < ns; ++s) {
+					const slotsmall& x = buf[b * SM + s];
+					sx[0] ^= x.hash[0]; sx[1] ^= x.hash[1];
+					sx[2] ^= x.hash[2]; sx[3] ^= x.hash[3];
+				}
+			}
+			fprintf(stderr, "[DJEZO] round-%d xor(safe %u/%u skip=%u): sm={%08x,%08x,%08x,%08x}\n",
+					r, included, NB, overflowed, sx[0], sx[1], sx[2], sx[3]);
+		};
+		xor_sm(0, 4); xor_sm(1, 5); xor_sm(2, 6); xor_sm(3, 7);
+
+		// treestiny[1][4096][RB8_NSLOTS_LD] : round-8
+		// hash[0] is content, hash[1] is pack.
+		{
+			std::vector<slottiny> buf(4096 * RB8_NSLOTS_LD);
+			cudaMemcpy(buf.data(), &device_eq->treestiny[0][0][0],
+					   buf.size() * sizeof(slottiny), cudaMemcpyDeviceToHost);
+			const u32 r8_safe_cap = RB8_NSLOTS_LD - 10;
+			u32 tx_content = 0, tx_pack = 0;
+			u32 included = 0, overflowed = 0;
+			for (u32 b = 0; b < 4096; ++b) {
+				u32 ns = hn8[b];
+				if (ns > r8_safe_cap) { ++overflowed; continue; }
+				++included;
+				for (u32 s = 0; s < ns; ++s) {
+					const slottiny& x = buf[b * RB8_NSLOTS_LD + s];
+					tx_content ^= x.hash[0];
+					tx_pack    ^= x.hash[1];
+				}
+			}
+			fprintf(stderr, "[DJEZO] round-8 xor(safe %u/4096 skip=%u): tn_content=%08x tn_pack=%08x\n",
+					included, overflowed, tx_content, tx_pack);
+		}
+	}
+
 	cudaError_t err = cudaDeviceSynchronize();
 	if (err != cudaSuccess)
 	{

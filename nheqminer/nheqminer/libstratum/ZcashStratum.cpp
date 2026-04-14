@@ -652,7 +652,10 @@ int benchmark_thread(int tid, ISolver *solver)
 void Solvers_doBenchmark(int hashes, const std::vector<ISolver *> &solvers) {
 	// generate array of various nonces
 	// Only randomize bytes 0-19, keep bytes 20-31 zero (GPU BLAKE2b constraint)
-	std::srand(std::time(0));
+	// EQUI_FIXED_NONCE: for cross-solver diagnostics, produce a deterministic
+	// nonce sequence so djezo and blackwell see identical inputs.
+	const bool fixed_nonce = std::getenv("EQUI_FIXED_NONCE") != nullptr;
+	std::srand(fixed_nonce ? 1u : (unsigned)std::time(0));
 	benchmark_nonces.push_back(new uint256());
 	benchmark_nonces.back()->begin()[19] = 1;
 	for (int i = 0; i < (hashes - 1); ++i)

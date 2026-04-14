@@ -70,6 +70,14 @@ struct eq_cuda_context_blackwell : public eq_cuda_context_blackwell_interface {
     bw::equi_state* device_eq;
     cudaStream_t stream;
 
+    // CUDA-graph capture: captured once, replayed every iteration to eliminate
+    // per-kernel launch overhead (10 kernels + 2 memcpys + 1 memset per iter).
+    // Pinned host buffers provide stable source/dest addresses for captured memcpys;
+    // host-side memcpy populates them before each graph launch.
+    cudaGraphExec_t graph_exec = nullptr;
+    uint64_t*       pinned_blake_h = nullptr;    // 8 u64: blake2b mid-state
+    void*           pinned_sols    = nullptr;    // sizeof(SolContainer)
+
     explicit eq_cuda_context_blackwell(int id);
     ~eq_cuda_context_blackwell() override;
 

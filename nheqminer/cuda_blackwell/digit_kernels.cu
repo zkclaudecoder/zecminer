@@ -144,16 +144,19 @@ u32 pack_bid_s0_s1(u32 bucketid, u32 s0, u32 s1) {
 
 // packer_default accessors for tree walk in digit_last_wdc (RB=8 mode).
 // SLOTBITS=10 so layout is [bucketid:12][s0:10][s1:10].
+// Mirrors djezo's packer_default convention (get_slot1 returns the s0 field,
+// get_slot0 returns the s1 field). This inverted naming is load-bearing: the
+// walk-back ordering is designed around it.
 __device__ __forceinline__ u32 pack_get_bucketid(u32 bid) { return (bid >> 20) & 0xFFFu; }
-__device__ __forceinline__ u32 pack_get_slot0(u32 bid, u32 /*s1*/) { return (bid >> 10) & 0x3FFu; }
-__device__ __forceinline__ u32 pack_get_slot1(u32 bid) { return bid & 0x3FFu; }
+__device__ __forceinline__ u32 pack_get_slot0(u32 bid, u32 /*s1*/) { return bid & 0x3FFu; }
+__device__ __forceinline__ u32 pack_get_slot1(u32 bid) { return (bid >> 10) & 0x3FFu; }
 
 // Same helpers but for the RB8_NSLOTS=640-slot arrays indexed by round0 trees;
 // for CONFIG_MODE_2 the encoding is identical since djezo calls pack with RB=8
 // in both cases (see equi_miner.cu lines 620, 799, etc.).
 __device__ __forceinline__ u32 pack_get_bucketid_r0(u32 bid) { return (bid >> 20) & 0xFFFu; }
-__device__ __forceinline__ u32 pack_get_slot0_r0(u32 bid, u32 /*s1*/) { return (bid >> 10) & 0x3FFu; }
-__device__ __forceinline__ u32 pack_get_slot1_r0(u32 bid) { return bid & 0x3FFu; }
+__device__ __forceinline__ u32 pack_get_slot0_r0(u32 bid, u32 /*s1*/) { return bid & 0x3FFu; }
+__device__ __forceinline__ u32 pack_get_slot1_r0(u32 bid) { return (bid >> 10) & 0x3FFu; }
 
 // Compile-time MAXPAIRS for digit_1: djezo uses 4*NRESTS = 4*256 = 1024
 static constexpr u32 D1_MAXPAIRS = 4u * NRESTS;
