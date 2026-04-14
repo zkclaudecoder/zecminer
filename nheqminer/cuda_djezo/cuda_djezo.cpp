@@ -34,7 +34,15 @@ cuda_djezo::cuda_djezo(int platf_id, int dev_id)
 		{
 			combo_mode = 2;
 		}
-		// SM 7.0+ (Volta, Turing, Ampere, Ada, Blackwell) use mode 1
+		// Blackwell (SM 12.0+): use mode 2 for ~21% performance gain.
+		// Mode 2 has smaller shared memory footprint, allowing more blocks per SM
+		// on Blackwell's 170 SMs (vs mode 1's bucket size of 1248).
+		// Override with DJEZO_MODE1 env var to force legacy mode 1.
+		else if (major >= 12 && getenv("DJEZO_MODE1") == nullptr)
+		{
+			combo_mode = 2;
+		}
+		// SM 7.0-11.x (Volta, Turing, Ampere, Ada) use mode 1
 	}
 	else
 		throw std::runtime_error("Unknown Compute/SM version.");

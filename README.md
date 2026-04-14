@@ -76,13 +76,16 @@ nheqminer\build\Release\nheqminer.exe -b 2000 -cd 0 -cv 0 -t 0
 
 ## Solvers
 
-| Solver | Speed (RTX 5090) | Notes |
-|--------|------------------|-------|
-| **djezo** (`-cv 0`) | ~1000+ Sols/s | Fastest. Uses shared memory for collision detection. |
-| tromp (`-cv 1`) | ~179 Sols/s | Simpler algorithm. Fallback if djezo has issues. |
+| Solver | Speed (RTX 5090 Laptop) | Speed (RTX 5090 Desktop) | Notes |
+|--------|------------------------|--------------------------|-------|
+| **djezo** (`-cv 0`) | ~1000 Sols/s | **~2300 Sols/s** | Fastest. Auto-selects CONFIG_MODE_2 on Blackwell. |
+| tromp (`-cv 1`) | ~179 Sols/s | ~350 Sols/s | Simpler fallback solver. |
+
+Set `DJEZO_MODE1=1` environment variable to force legacy CONFIG_MODE_1 if needed.
 
 ## What was changed from original nheqminer
 
+- **CONFIG_MODE_2 on Blackwell (~21% gain)**: Auto-selects smaller bucket config (SM=640 vs 1248) on SM 12.0+. Smaller shared memory footprint allows more blocks per SM on 170-SM GPUs.
 - **Blackwell warp sync fix**: Added `__syncwarp()` barriers in djezo's `digit_last_wdc` kernel — Blackwell's independent thread scheduling caused stale shared memory reads during solution reconstruction
 - **CUDA API modernization**: `__shfl()` -> `__shfl_sync()`, `__any()` -> `__any_sync()`
 - **Removed deprecated headers**: `device_functions_decls.h`, `sm_32_intrinsics.h`

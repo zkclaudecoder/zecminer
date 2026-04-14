@@ -301,7 +301,7 @@ echo Pool: %POOL%
 echo Wallet: %WALLET%.%WORKER%
 echo.
 
-nheqminer\build\Release\nheqminer.exe -l %POOL% -u %WALLET%.%WORKER% -p %PASS% -cd $cdLine -cv $($best.Solver)$cbLine$ctLine -t 0
+"%~dp0nheqminer.exe" -l %POOL% -u %WALLET%.%WORKER% -p %PASS% -cd $cdLine -cv $($best.Solver)$cbLine$ctLine -t 0
 
 pause
 "@
