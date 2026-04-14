@@ -13,6 +13,8 @@ option(USE_CPU_XENONCAT "USE CPU_XENONCAT" OFF)  # Disabled: requires Linux asm 
 #### GPU solvers
 option(USE_CUDA_TROMP "USE CUDA_TROMP" OFF)
 option(USE_CUDA_DJEZO "USE CUDA_DJEZO" ON)
+#### experimental — modern Blackwell-tuned solver (Phase 0 prototype)
+option(USE_CUDA_BLACKWELL "USE CUDA_BLACKWELL (experimental, SM 9.0+)" OFF)
 
 ## Add solver definitions
 if (USE_CPU_TROMP)
@@ -30,6 +32,10 @@ endif()
 if (USE_CUDA_DJEZO)
     add_definitions(-DUSE_CUDA_DJEZO)
     message("-- USE_CUDA_DJEZO DEFINED")
+endif()
+if (USE_CUDA_BLACKWELL)
+    add_definitions(-DUSE_CUDA_BLACKWELL)
+    message("-- USE_CUDA_BLACKWELL DEFINED")
 endif()
 
 
@@ -157,6 +163,9 @@ endif()
 if (USE_CUDA_DJEZO)
     add_subdirectory(cuda_djezo)
 endif()
+if (USE_CUDA_BLACKWELL)
+    add_subdirectory(cuda_blackwell)
+endif()
 
 ADD_EXECUTABLE(${PROJECT_NAME} ${SOURCE_FILES})
 
@@ -182,4 +191,7 @@ if (USE_CUDA_TROMP)
 endif()
 if (USE_CUDA_DJEZO)
     target_link_libraries(${PROJECT_NAME} cuda_djezo)
+endif()
+if (USE_CUDA_BLACKWELL)
+    target_link_libraries(${PROJECT_NAME} cuda_blackwell)
 endif()
