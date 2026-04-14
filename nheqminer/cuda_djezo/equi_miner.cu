@@ -2145,14 +2145,24 @@ __host__ void eq_cuda_context<RB, SM, SSM, THREADS, PACKER>::solve(const char *t
 	digit_2<RB, SM, SSM, PACKER, 4 * NRESTS, THREADS> << <blocks, THREADS >> >(device_eq);
 	digit_3<RB, SM, SSM, PACKER, 4 * NRESTS, THREADS> << <blocks, THREADS >> >(device_eq);
 
-	// Phase 0/1 diagnostic: dump round-1..3 bucket fills for cross-validation
+	if (cancelf()) return;
+
+	digit_4<RB, SM, SSM, PACKER, 4 * NRESTS, THREADS> << <blocks, THREADS >> >(device_eq);
+	digit_5<RB, SM, SSM, PACKER, 4 * NRESTS, THREADS> << <blocks, THREADS >> >(device_eq);
+	digit_6<RB, SM, SSM - 1, PACKER, 3 * NRESTS> << <blocks, NRESTS >> >(device_eq);
+	digit_7<RB, SM, SSM - 1, PACKER, 3 * NRESTS> << <blocks, NRESTS >> >(device_eq);
+	digit_8<RB, SM, SSM - 1, PACKER, 3 * NRESTS> << <blocks, NRESTS >> >(device_eq);
+	digit_last_wdc<RB, SM, SSM - 3, 2, PACKER, 64, 8, 4> << <4096, 256 / 2 >> >(device_eq);
+
+	// Phase 0/1 diagnostic: dump round-1..7 bucket fills for cross-validation
 	// against cuda_blackwell. Enable with DJEZO_DUMP_ROUND1=1 in env.
+	// (round-8 uses nslots8[], not nslots[]; we print it separately below.)
 	static const bool djezo_dump_r1 = std::getenv("DJEZO_DUMP_ROUND1") != nullptr;
 	if (djezo_dump_r1) {
 		cudaDeviceSynchronize();
 		constexpr u32 NB = 1u << (DIGITBITS - RB);
 		u32 hnslots[NB];
-		for (int r = 1; r <= 5; ++r) {
+		for (int r = 1; r <= 7; ++r) {
 			cudaMemcpy(hnslots, &device_eq->edata.nslots[r], sizeof(hnslots), cudaMemcpyDeviceToHost);
 			u64 total = 0, min_v = ~0ULL, max_v = 0, nonempty = 0;
 			for (u32 i = 0; i < NB; ++i) {
@@ -2162,24 +2172,25 @@ __host__ void eq_cuda_context<RB, SM, SSM, THREADS, PACKER>::solve(const char *t
 				if (hnslots[i] > 0) ++nonempty;
 			}
 			fprintf(stderr, "[DJEZO] round-%d nslots: total=%llu mean=%.3f min=%llu max=%llu nonempty=%llu/%u\n",
-					r,
-					(unsigned long long)total,
-					(double)total / NB,
-					(unsigned long long)min_v,
-					(unsigned long long)max_v,
-					(unsigned long long)nonempty,
-					NB);
+					r, (unsigned long long)total, (double)total / NB,
+					(unsigned long long)min_v, (unsigned long long)max_v,
+					(unsigned long long)nonempty, NB);
 		}
+		// round-8 goes to nslots8[4096] (different array, 4096 entries always)
+		u32 hn8[4096];
+		cudaMemcpy(hn8, &device_eq->edata.nslots8, sizeof(hn8), cudaMemcpyDeviceToHost);
+		u64 total = 0, min_v = ~0ULL, max_v = 0, nonempty = 0;
+		for (u32 i = 0; i < 4096; ++i) {
+			total += hn8[i];
+			if (hn8[i] < min_v) min_v = hn8[i];
+			if (hn8[i] > max_v) max_v = hn8[i];
+			if (hn8[i] > 0) ++nonempty;
+		}
+		fprintf(stderr, "[DJEZO] round-8 nslots8: total=%llu mean=%.3f min=%llu max=%llu nonempty=%llu/4096\n",
+				(unsigned long long)total, (double)total / 4096,
+				(unsigned long long)min_v, (unsigned long long)max_v,
+				(unsigned long long)nonempty);
 	}
-
-	if (cancelf()) return;
-
-	digit_4<RB, SM, SSM, PACKER, 4 * NRESTS, THREADS> << <blocks, THREADS >> >(device_eq);
-	digit_5<RB, SM, SSM, PACKER, 4 * NRESTS, THREADS> << <blocks, THREADS >> >(device_eq);
-	digit_6<RB, SM, SSM - 1, PACKER, 3 * NRESTS> << <blocks, NRESTS >> >(device_eq);
-	digit_7<RB, SM, SSM - 1, PACKER, 3 * NRESTS> << <blocks, NRESTS >> >(device_eq);
-	digit_8<RB, SM, SSM - 1, PACKER, 3 * NRESTS> << <blocks, NRESTS >> >(device_eq);
-	digit_last_wdc<RB, SM, SSM - 3, 2, PACKER, 64, 8, 4> << <4096, 256 / 2 >> >(device_eq);
 
 	cudaError_t err = cudaDeviceSynchronize();
 	if (err != cudaSuccess)

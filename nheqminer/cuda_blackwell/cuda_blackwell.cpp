@@ -92,18 +92,24 @@ void eq_cuda_context_blackwell::solve(
     bw::launch_digit_3(device_eq, stream);
     bw::launch_digit_4(device_eq, stream);
     bw::launch_digit_5(device_eq, stream);
+    bw::launch_digit_6(device_eq, stream);
+    bw::launch_digit_7(device_eq, stream);
+    bw::launch_digit_8(device_eq, stream);
 
     static const bool verbose = std::getenv("DJEZO_BW_VERBOSE") != nullptr;
     if (verbose) {
-        // Pull back round-1..5 slot-count arrays for sanity checks
-        uint32_t ns[5][bw::NBUCKETS];
-        for (int r = 1; r <= 5; ++r) {
+        // Pull back round-1..7 nslots + round-8 nslots8 for sanity checks
+        uint32_t ns[7][bw::NBUCKETS];
+        for (int r = 1; r <= 7; ++r) {
             checkCudaErrorsBW(cudaMemcpyAsync(ns[r - 1], &device_eq->edata.nslots[r],
                                                sizeof(ns[r - 1]), cudaMemcpyDeviceToHost, stream));
         }
+        uint32_t ns8[4096];
+        checkCudaErrorsBW(cudaMemcpyAsync(ns8, &device_eq->edata.nslots8,
+                                           sizeof(ns8), cudaMemcpyDeviceToHost, stream));
         checkCudaErrorsBW(cudaStreamSynchronize(stream));
 
-        for (int r = 1; r <= 5; ++r) {
+        for (int r = 1; r <= 7; ++r) {
             uint64_t total = 0, min_v = ~0ULL, max_v = 0, nonempty = 0;
             for (uint32_t i = 0; i < bw::NBUCKETS; ++i) {
                 total += ns[r - 1][i];
@@ -118,6 +124,19 @@ void eq_cuda_context_blackwell::solve(
                       << " nonempty=" << nonempty << "/" << bw::NBUCKETS
                       << std::endl;
         }
+        uint64_t total = 0, min_v = ~0ULL, max_v = 0, nonempty = 0;
+        for (uint32_t i = 0; i < 4096; ++i) {
+            total += ns8[i];
+            if (ns8[i] < min_v) min_v = ns8[i];
+            if (ns8[i] > max_v) max_v = ns8[i];
+            if (ns8[i] > 0) ++nonempty;
+        }
+        std::cerr << "[BW] round-8 nslots8: total=" << total
+                  << " mean=" << (double)total / 4096
+                  << " min=" << min_v
+                  << " max=" << max_v
+                  << " nonempty=" << nonempty << "/4096"
+                  << std::endl;
     } else {
         checkCudaErrorsBW(cudaStreamSynchronize(stream));
     }
