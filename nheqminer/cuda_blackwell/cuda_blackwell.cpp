@@ -94,7 +94,7 @@ void eq_cuda_context_blackwell::solve(
     const char* header, unsigned int header_len,
     const char* nonce, unsigned int nonce_len,
     std::function<bool()> /*cancelf*/,
-    std::function<void(const std::vector<uint32_t>&, size_t, const unsigned char*)> /*solutionf*/,
+    std::function<void(const std::vector<uint32_t>&, size_t, const unsigned char*)> solutionf,
     std::function<void(void)> hashdonef)
 {
     // Phase 0: run digit_first + digit_1 and report bucket stats. No solutions

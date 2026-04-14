@@ -80,8 +80,19 @@ nheqminer\build\Release\nheqminer.exe -b 2000 -cd 0 -cv 0 -t 0
 |--------|------------------------|--------------------------|-------|
 | **djezo** (`-cv 0`) | ~1000 Sols/s | **~2300 Sols/s** | Fastest. Auto-selects CONFIG_MODE_2 on Blackwell. |
 | tromp (`-cv 1`) | ~179 Sols/s | ~350 Sols/s | Simpler fallback solver. |
+| blackwell (`-cv 2`) | n/a | 1800+ Sols/s (benchmark) | **Experimental. Produces invalid solutions — do not use for mining yet.** |
 
 Set `DJEZO_MODE1=1` environment variable to force legacy CONFIG_MODE_1 if needed.
+
+### About `cuda_blackwell` (`-cv 2`)
+
+A ground-up modern Equihash solver targeting Blackwell (SM 12.0+). Full 9-round
+pipeline compiles and runs — round-by-round bucket statistics match djezo within
+0.02% (atomicAdd ordering noise) — but solutions are currently rejected by the
+pool with "invalid collision length". The bug is in the intermediate hash-data
+encoding somewhere between digit_2 and digit_last_wdc; debug work is ongoing.
+Enable with `-DUSE_CUDA_BLACKWELL=ON` at build time. **For actual mining, use
+`-cv 0` (djezo).**
 
 ## What was changed from original nheqminer
 
