@@ -51,6 +51,7 @@ void launch_digit_5(equi_state* device_eq, cudaStream_t stream);
 void launch_digit_6(equi_state* device_eq, cudaStream_t stream);
 void launch_digit_7(equi_state* device_eq, cudaStream_t stream);
 void launch_digit_8(equi_state* device_eq, cudaStream_t stream);
+void launch_digit_last_wdc(equi_state* device_eq, cudaStream_t stream);
 
 } // namespace bw
 

@@ -9,11 +9,35 @@
 #include <vector>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include "cuda_runtime.h"
 
 #include "cuda_blackwell.hpp"
 #include "eq_context.hpp"
 #include "../cpu_tromp/blake2/blake2.h"
+
+// CPU-side duplicate check + pair-sort, matching djezo's post-processing
+static int compu32_bw(const void* pa, const void* pb) {
+    uint32_t a = *(uint32_t*)pa, b = *(uint32_t*)pb;
+    return a < b ? -1 : a == b ? 0 : +1;
+}
+static bool duped_bw(const uint32_t* prf) {
+    uint32_t sort[512];
+    std::memcpy(sort, prf, sizeof(sort));
+    std::qsort(sort, 512, sizeof(uint32_t), &compu32_bw);
+    for (uint32_t i = 1; i < 512; ++i)
+        if (sort[i] <= sort[i - 1]) return true;
+    return false;
+}
+static void sort_pair_bw(uint32_t* a, uint32_t len) {
+    uint32_t* b = a + len;
+    uint32_t tmp, need_sort = 0;
+    for (uint32_t i = 0; i < len; ++i)
+        if (need_sort || a[i] > b[i]) {
+            need_sort = 1;
+            tmp = a[i]; a[i] = b[i]; b[i] = tmp;
+        }
+}
 
 // Match djezo/bw Equihash parameters (MUST stay in sync with bucket_layout.hpp)
 static constexpr uint32_t WN_ = 200;
@@ -95,6 +119,7 @@ void eq_cuda_context_blackwell::solve(
     bw::launch_digit_6(device_eq, stream);
     bw::launch_digit_7(device_eq, stream);
     bw::launch_digit_8(device_eq, stream);
+    bw::launch_digit_last_wdc(device_eq, stream);
 
     static const bool verbose = std::getenv("DJEZO_BW_VERBOSE") != nullptr;
     if (verbose) {
@@ -139,6 +164,39 @@ void eq_cuda_context_blackwell::solve(
                   << std::endl;
     } else {
         checkCudaErrorsBW(cudaStreamSynchronize(stream));
+    }
+
+    // --- Pull back the solutions container and emit valid solutions ---
+    static constexpr uint32_t MAXREALSOLS_HOST = 9;
+    struct SolContainer {
+        uint32_t sols[MAXREALSOLS_HOST][512];
+        uint32_t nsols;
+    };
+    SolContainer cont;
+    cudaError_t err = cudaMemcpyAsync(&cont, &device_eq->edata.srealcont,
+                                       sizeof(cont), cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        hashdonef();
+        return;
+    }
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        hashdonef();
+        return;
+    }
+
+    // Post-process solutions (matches djezo's equi_miner.cu:2109-2126)
+    for (uint32_t s = 0; s < cont.nsols && s < MAXREALSOLS_HOST; ++s) {
+        if (duped_bw(cont.sols[s])) continue;
+        for (uint32_t level = 0; level < 9; ++level)
+            for (uint32_t i = 0; i < (1u << 9); i += (2u << level))
+                sort_pair_bw(&cont.sols[s][i], 1u << level);
+        std::vector<uint32_t> idx(bw::PROOFSIZE);
+        for (uint32_t i = 0; i < bw::PROOFSIZE; ++i)
+            idx[i] = cont.sols[s][i];
+        solutionf(idx, 20 /*DIGITBITS*/, nullptr);
     }
 
     hashdonef();

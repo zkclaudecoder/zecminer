@@ -1148,6 +1148,270 @@ void digit_8_kernel(equi_state* eq) {
 }
 
 // ============================================================================
+// digit_last_wdc_kernel — port of djezo's digit_last_wdc
+// ============================================================================
+// Solution reconstruction: walks back through the tree structures to recover
+// the 512 original indices for each solution candidate.
+//
+// Launch: <<<4096, 128>>> (djezo uses <<<4096, 256/2>>>)
+//   FCT=2, DUPBITS=8, W=4, MAXPAIRS=64
+//
+// Warp layout: 4 warps per block, each warp processes one candidate at a time
+//              via the `par` index.
+//
+// CRITICAL: The __syncwarp() calls between levels ARE REQUIRED on Blackwell.
+// Without them, lane-to-lane shared memory communication races and the kernel
+// produces invalid solutions. This was the bug we discovered earlier in djezo.
+
+static constexpr u32 DLWDC_FCT      = 2;
+static constexpr u32 DLWDC_DUPBITS  = 8;
+static constexpr u32 DLWDC_W        = 4;
+static constexpr u32 DLWDC_MAXPAIRS = 64;
+static constexpr int DLWDC_SSM      = 9;  // was SSM-3 in djezo
+
+__global__ __launch_bounds__(128, 2)
+void digit_last_wdc_kernel(equi_state* eq) {
+    __shared__ u8 shared_data[8192];
+    int* ht_len    = (int*)(&shared_data[0]);
+    int* pairs     = ht_len;
+    u32* lastword  = (u32*)(&shared_data[256 * 4]);
+    u16* ht        = (u16*)(&shared_data[256 * 4 + RB8_NSLOTS_LD * 4]);
+    u32* pairs_len = (u32*)(&shared_data[8188]);
+
+    const u32 threadid = threadIdx.x;
+    const u32 bucketid = blockIdx.x;
+
+    // Reset hashtable: 128 threads / FCT=2 -> each writes 2 ht_len entries (256 total).
+    #pragma unroll
+    for (u32 i = 0; i != DLWDC_FCT; ++i)
+        ht_len[i * (256 / DLWDC_FCT) + threadid] = 0;
+
+    if (threadid == ((256 / DLWDC_FCT) - 1))
+        *pairs_len = 0;
+
+    slottiny* buck = eq->treestiny[0][bucketid];
+    u32 bsize = min(eq->edata.nslots8[bucketid], (u32)RB8_NSLOTS_LD);
+
+    u32 si[3 * DLWDC_FCT];
+    u32 hr[3 * DLWDC_FCT];
+    int pos[3 * DLWDC_FCT];
+    u32 lw[3 * DLWDC_FCT];
+    #pragma unroll
+    for (u32 i = 0; i != (3 * DLWDC_FCT); ++i)
+        pos[i] = DLWDC_SSM;
+
+    __syncthreads();
+
+    #pragma unroll
+    for (u32 i = 0; i != (3 * DLWDC_FCT); ++i) {
+        si[i] = i * (256 / DLWDC_FCT) + threadid;
+        if (si[i] >= bsize) break;
+        const slottiny* pslot1 = buck + si[i];
+        uint2 tt = *(uint2*)(&pslot1->hash[0]);
+        lw[i] = tt.x;
+        lastword[si[i]] = lw[i];
+        hr[i] = (lw[i] >> 20) & 0xFFu;   // SAFE_BFE(_, lw[i], 20, 8)
+        pos[i] = atomicAdd(&ht_len[hr[i]], 1);
+        if (pos[i] < (DLWDC_SSM - 1))
+            ht[hr[i] * (DLWDC_SSM - 1) + pos[i]] = (u16)si[i];
+    }
+
+    __syncthreads();
+
+    #pragma unroll
+    for (u32 i = 0; i != (3 * DLWDC_FCT); ++i) {
+        if (pos[i] >= DLWDC_SSM) continue;
+        for (int k = 0; k != pos[i]; ++k) {
+            u16 prev = ht[hr[i] * (DLWDC_SSM - 1) + k];
+            if (lw[i] != lastword[prev]) continue;
+            u32 pindex = atomicAdd(pairs_len, 1);
+            if (pindex >= DLWDC_MAXPAIRS) break;
+            pairs[pindex] = (int)__byte_perm(si[i], prev, 0x1054);
+        }
+    }
+
+    __syncthreads();
+    u32 plen = min(*pairs_len, (u32)64);
+
+    // -- Tree walk-back to reconstruct 512 indices per candidate --
+    #define CALC_LEVEL(a, b, c, d) do {                                               \
+        u32 plvl = levels[b];                                                         \
+        u32* bucks = eq->round4bidandsids[pack_get_bucketid(plvl)];                   \
+        u32 slot1 = pack_get_slot1(plvl);                                             \
+        u32 slot0 = pack_get_slot0(plvl, slot1);                                      \
+        levels[b] = bucks[slot1];                                                     \
+        levels[c] = bucks[slot0];                                                     \
+    } while (0)
+
+    #define CALC_LEVEL_SMALL(a, b, c, d) do {                                         \
+        u32 plvl = levels[b];                                                         \
+        slotsmall* bucks = eq->treessmall[a][pack_get_bucketid(plvl)];                \
+        u32 slot1 = pack_get_slot1(plvl);                                             \
+        u32 slot0 = pack_get_slot0(plvl, slot1);                                      \
+        levels[b] = bucks[slot1].hash[d];                                             \
+        levels[c] = bucks[slot0].hash[d];                                             \
+    } while (0)
+
+    u32 lane = threadIdx.x & 0x1f;
+    u32 par  = threadIdx.x >> 5;
+
+    u32* levels = (u32*)&pairs[DLWDC_MAXPAIRS + (par << DLWDC_DUPBITS)];
+    u32* susp   = levels;
+
+    while (par < plen) {
+        int pair = pairs[par];
+        par += DLWDC_W;
+
+        if (lane % 16 == 0) {
+            u32 plvl;
+            if (lane == 0) plvl = buck[__byte_perm(pair, 0, 0x4510)].hash[1];
+            else           plvl = buck[__byte_perm(pair, 0, 0x4532)].hash[1];
+            slotsmall* bucks = eq->treessmall[1][pack_get_bucketid(plvl)];
+            u32 slot1 = pack_get_slot1(plvl);
+            u32 slot0 = pack_get_slot0(plvl, slot1);
+            levels[lane]     = bucks[slot1].hash[2];
+            levels[lane + 8] = bucks[slot0].hash[2];
+        }
+        __syncwarp(0xFFFFFFFF);
+
+        if (lane % 8 == 0) CALC_LEVEL_SMALL(0, lane, lane + 4, 3);
+        __syncwarp(0xFFFFFFFF);
+
+        if (lane % 4 == 0) CALC_LEVEL_SMALL(2, lane, lane + 2, 3);
+        __syncwarp(0xFFFFFFFF);
+
+        if (lane % 2 == 0) CALC_LEVEL(0, lane, lane + 1, 4);
+        __syncwarp(0xFFFFFFFF);
+
+        u32 ind[16];
+        u32 f1 = levels[lane];
+        const slottiny* buck_v4 = &eq->round3trees[pack_get_bucketid(f1)].treestiny[0];
+        const u32 slot1_v4 = pack_get_slot1(f1);
+        const u32 slot0_v4 = pack_get_slot0(f1, slot1_v4);
+
+        susp[lane]      = 0xffffffff;
+        susp[32 + lane] = 0xffffffff;
+        __syncwarp(0xFFFFFFFF);
+
+        #define CHECK_DUP(a) \
+            __any_sync(0xFFFFFFFF, atomicExch(&susp[(ind[a] & ((1u << DLWDC_DUPBITS) - 1u))], (ind[a] >> DLWDC_DUPBITS)) == (ind[a] >> DLWDC_DUPBITS))
+
+        u32 f2 = buck_v4[slot1_v4].hash[1];
+        const slottiny* buck_v3_1 = &eq->round2trees[pack_get_bucketid(f2)].treestiny[0];
+        const u32 slot1_v3_1 = pack_get_slot1(f2);
+        const u32 slot0_v3_1 = pack_get_slot0(f2, slot1_v3_1);
+
+        susp[64 + lane] = 0xffffffff;
+        susp[96 + lane] = 0xffffffff;
+        __syncwarp(0xFFFFFFFF);
+
+        u32 f0 = buck_v3_1[slot1_v3_1].hash[1];
+        const slot* buck_v2_1 = eq->trees[0][pack_get_bucketid(f0)];
+        const u32 slot1_v2_1 = pack_get_slot1(f0);
+        const u32 slot0_v2_1 = pack_get_slot0(f0, slot1_v2_1);
+
+        susp[128 + lane] = 0xffffffff;
+        susp[160 + lane] = 0xffffffff;
+        __syncwarp(0xFFFFFFFF);
+
+        u32 f3 = buck_v2_1[slot1_v2_1].hash[6];
+        const slot* buck_fin_1 = eq->round0trees[pack_get_bucketid_r0(f3)];
+        const u32 slot1_fin_1 = pack_get_slot1_r0(f3);
+        const u32 slot0_fin_1 = pack_get_slot0_r0(f3, slot1_fin_1);
+
+        susp[192 + lane] = 0xffffffff;
+        susp[224 + lane] = 0xffffffff;
+        __syncwarp(0xFFFFFFFF);
+
+        ind[0] = buck_fin_1[slot1_fin_1].hash[7];
+        if (CHECK_DUP(0)) continue;
+        ind[1] = buck_fin_1[slot0_fin_1].hash[7];
+        if (CHECK_DUP(1)) continue;
+
+        u32 f4 = buck_v2_1[slot0_v2_1].hash[6];
+        const slot* buck_fin_2 = eq->round0trees[pack_get_bucketid_r0(f4)];
+        const u32 slot1_fin_2 = pack_get_slot1_r0(f4);
+        const u32 slot0_fin_2 = pack_get_slot0_r0(f4, slot1_fin_2);
+        ind[2] = buck_fin_2[slot1_fin_2].hash[7]; if (CHECK_DUP(2)) continue;
+        ind[3] = buck_fin_2[slot0_fin_2].hash[7]; if (CHECK_DUP(3)) continue;
+
+        u32 f5 = buck_v3_1[slot0_v3_1].hash[1];
+        const slot* buck_v2_2 = eq->trees[0][pack_get_bucketid(f5)];
+        const u32 slot1_v2_2 = pack_get_slot1(f5);
+        const u32 slot0_v2_2 = pack_get_slot0(f5, slot1_v2_2);
+        u32 f6 = buck_v2_2[slot1_v2_2].hash[6];
+        const slot* buck_fin_3 = eq->round0trees[pack_get_bucketid_r0(f6)];
+        const u32 slot1_fin_3 = pack_get_slot1_r0(f6);
+        const u32 slot0_fin_3 = pack_get_slot0_r0(f6, slot1_fin_3);
+        ind[4] = buck_fin_3[slot1_fin_3].hash[7]; if (CHECK_DUP(4)) continue;
+        ind[5] = buck_fin_3[slot0_fin_3].hash[7]; if (CHECK_DUP(5)) continue;
+
+        u32 f7 = buck_v2_2[slot0_v2_2].hash[6];
+        const slot* buck_fin_4 = eq->round0trees[pack_get_bucketid_r0(f7)];
+        const u32 slot1_fin_4 = pack_get_slot1_r0(f7);
+        const u32 slot0_fin_4 = pack_get_slot0_r0(f7, slot1_fin_4);
+        ind[6] = buck_fin_4[slot1_fin_4].hash[7]; if (CHECK_DUP(6)) continue;
+        ind[7] = buck_fin_4[slot0_fin_4].hash[7]; if (CHECK_DUP(7)) continue;
+
+        u32 f8 = buck_v4[slot0_v4].hash[1];
+        const slottiny* buck_v3_2 = &eq->round2trees[pack_get_bucketid(f8)].treestiny[0];
+        const u32 slot1_v3_2 = pack_get_slot1(f8);
+        const u32 slot0_v3_2 = pack_get_slot0(f8, slot1_v3_2);
+        u32 f9 = buck_v3_2[slot1_v3_2].hash[1];
+        const slot* buck_v2_3 = eq->trees[0][pack_get_bucketid(f9)];
+        const u32 slot1_v2_3 = pack_get_slot1(f9);
+        const u32 slot0_v2_3 = pack_get_slot0(f9, slot1_v2_3);
+        u32 f10 = buck_v2_3[slot1_v2_3].hash[6];
+        const slot* buck_fin_5 = eq->round0trees[pack_get_bucketid_r0(f10)];
+        const u32 slot1_fin_5 = pack_get_slot1_r0(f10);
+        const u32 slot0_fin_5 = pack_get_slot0_r0(f10, slot1_fin_5);
+        ind[8] = buck_fin_5[slot1_fin_5].hash[7]; if (CHECK_DUP(8)) continue;
+        ind[9] = buck_fin_5[slot0_fin_5].hash[7]; if (CHECK_DUP(9)) continue;
+
+        u32 f11 = buck_v2_3[slot0_v2_3].hash[6];
+        const slot* buck_fin_6 = eq->round0trees[pack_get_bucketid_r0(f11)];
+        const u32 slot1_fin_6 = pack_get_slot1_r0(f11);
+        const u32 slot0_fin_6 = pack_get_slot0_r0(f11, slot1_fin_6);
+        ind[10] = buck_fin_6[slot1_fin_6].hash[7]; if (CHECK_DUP(10)) continue;
+        ind[11] = buck_fin_6[slot0_fin_6].hash[7]; if (CHECK_DUP(11)) continue;
+
+        u32 f12 = buck_v3_2[slot0_v3_2].hash[1];
+        const slot* buck_v2_4 = eq->trees[0][pack_get_bucketid(f12)];
+        const u32 slot1_v2_4 = pack_get_slot1(f12);
+        const u32 slot0_v2_4 = pack_get_slot0(f12, slot1_v2_4);
+        u32 f13 = buck_v2_4[slot1_v2_4].hash[6];
+        const slot* buck_fin_7 = eq->round0trees[pack_get_bucketid_r0(f13)];
+        const u32 slot1_fin_7 = pack_get_slot1_r0(f13);
+        const u32 slot0_fin_7 = pack_get_slot0_r0(f13, slot1_fin_7);
+        ind[12] = buck_fin_7[slot1_fin_7].hash[7]; if (CHECK_DUP(12)) continue;
+        ind[13] = buck_fin_7[slot0_fin_7].hash[7]; if (CHECK_DUP(13)) continue;
+
+        u32 f14 = buck_v2_4[slot0_v2_4].hash[6];
+        const slot* buck_fin_8 = eq->round0trees[pack_get_bucketid_r0(f14)];
+        const u32 slot1_fin_8 = pack_get_slot1_r0(f14);
+        const u32 slot0_fin_8 = pack_get_slot0_r0(f14, slot1_fin_8);
+        ind[14] = buck_fin_8[slot1_fin_8].hash[7]; if (CHECK_DUP(14)) continue;
+        ind[15] = buck_fin_8[slot0_fin_8].hash[7]; if (CHECK_DUP(15)) continue;
+
+        u32 soli;
+        if (lane == 0)
+            soli = atomicAdd(&eq->edata.srealcont.nsols, 1);
+        soli = __shfl_sync(0xFFFFFFFF, soli, 0);
+
+        if (soli < MAXREALSOLS) {
+            u32 pos = lane << 4;
+            *(uint4*)(&eq->edata.srealcont.sols[soli][pos])      = *(uint4*)(&ind[0]);
+            *(uint4*)(&eq->edata.srealcont.sols[soli][pos + 4])  = *(uint4*)(&ind[4]);
+            *(uint4*)(&eq->edata.srealcont.sols[soli][pos + 8])  = *(uint4*)(&ind[8]);
+            *(uint4*)(&eq->edata.srealcont.sols[soli][pos + 12]) = *(uint4*)(&ind[12]);
+        }
+    }
+    #undef CHECK_DUP
+    #undef CALC_LEVEL
+    #undef CALC_LEVEL_SMALL
+}
+
+// ============================================================================
 // Host launchers
 // ============================================================================
 
@@ -1192,6 +1456,11 @@ void launch_digit_7(equi_state* device_eq, cudaStream_t stream) {
 
 void launch_digit_8(equi_state* device_eq, cudaStream_t stream) {
     digit_8_kernel<<<NBUCKETS, NRESTS, 0, stream>>>(device_eq);
+}
+
+void launch_digit_last_wdc(equi_state* device_eq, cudaStream_t stream) {
+    // djezo's layout: <<<4096, 256/2>>> = 4096 blocks, 128 threads/block
+    digit_last_wdc_kernel<<<4096, 128, 0, stream>>>(device_eq);
 }
 
 } // namespace bw
