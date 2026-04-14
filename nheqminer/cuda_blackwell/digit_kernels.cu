@@ -61,11 +61,11 @@ void digit_first_kernel(equi_state* eq, u32 nonce) {
     u32* v32 = (u32*)my_h;
 
     // ---- First hash: bytes 0..24 (200 bits = 25 bytes, but stored aligned) ----
-    // Bucket id = top 12 bits of first 32-bit word (per CONFIG_MODE_2: BUCKBITS=12)
-    // Matches djezo's logic for RB=8.
+    // round0trees always has 4096 buckets regardless of RB — use bits [12..24]
+    // of bexor (12-bit bucket id). Matches djezo's `bfe.u32 %0, bexor, 12, 12`.
     {
         u32 bexor = __byte_perm(v32[0], 0, 0x4012); // first 20 bits
-        u32 bucketid = (bexor >> 8) & BUCKMASK;     // 12-bit bucket id
+        u32 bucketid = (bexor >> 12) & 0xFFFu;      // 12-bit bucket id
         u32 slotp = atomicAdd(&eq->edata.nslots0[bucketid], 1);
         if (slotp < RB8_NSLOTS) {
             slot* s = &eq->round0trees[bucketid][slotp];
@@ -86,7 +86,7 @@ void digit_first_kernel(equi_state* eq, u32 nonce) {
     // ---- Second hash: bytes 25..49 ----
     {
         u32 bexor = __byte_perm(v32[6], 0, 0x0123);
-        u32 bucketid = (bexor >> 8) & BUCKMASK;
+        u32 bucketid = (bexor >> 12) & 0xFFFu;      // same bfe 12, 12 as above
         u32 slotp = atomicAdd(&eq->edata.nslots0[bucketid], 1);
         if (slotp < RB8_NSLOTS) {
             slot* s = &eq->round0trees[bucketid][slotp];
@@ -106,46 +106,185 @@ void digit_first_kernel(equi_state* eq, u32 nonce) {
 }
 
 // ============================================================================
-// digit_1_kernel — STUB (Phase 0 still TODO)
+// digit_1_kernel — Phase 0 v1: algorithmic port of djezo's digit_1
 // ============================================================================
 //
-// Architecture target: producer/consumer warp specialization.
+// STRATEGY: port djezo's algorithm line-for-line first, validate correctness,
+// THEN add producer/consumer warp specialization as a separate optimization.
 //
-//   __shared__ slot ring[kPipelineDepth][NSLOTS];        // bucket-sized scratch
-//   __shared__ cuda::barrier<cuda::thread_scope_block> bar[kPipelineDepth];
-//   __shared__ u32 bsize[kPipelineDepth];
+// Launch config: <<<NBUCKETS=4096, THREADS=512>>>
+//   - one block per bucket
+//   - each thread processes 2 slots (total 1024 slot indices per block, cut
+//     off at actual bsize which maxes at RB8_NSLOTS=640)
 //
-// At init (one warp does this):
-//   for (int i = 0; i < kPipelineDepth; ++i)
-//       init(&bar[i], blockDim.x);
+// Shared memory per block (CONFIG_MODE_2 sized):
+//   ht[256][SSM-1]        = 256 * 11 * 2 = 5,632 bytes  (xhash-indexed HT)
+//   lastword1[640]        = 640 * 8       = 5,120 bytes  (first 64 bits of each slot)
+//   lastword2[640]        = 640 * 16      = 10,240 bytes (next 128 bits)
+//   ht_len[MAXPAIRS=1024] = 1024 * 4      = 4,096 bytes  (collision counts / pair list)
+//   misc scalars                          ~     16 bytes
+//   TOTAL: ~25 KB per block → fits ~3 blocks/SM on Blackwell's 100 KB default
 //
-// PRODUCER warp (warp 0):
-//   while (more buckets) {
-//       int slot = bucket_idx % kPipelineDepth;
-//       wait_for_drain(bar[slot]);
-//       size = eq->edata.nslots0[bucket_idx];
-//       cuda::memcpy_async(producer_warp, ring[slot], &eq->round0trees[bucket_idx],
-//                          size * sizeof(slot), bar[slot]);
-//       bsize[slot] = size;
-//   }
-//
-// CONSUMER warps (warps 1..N):
-//   while (more buckets) {
-//       int slot = bucket_idx % kPipelineDepth;
-//       bar[slot].arrive_and_wait();
-//       // collision-find on ring[slot][0..bsize[slot]] — exact same logic as
-//       // djezo's digit_1 inner loop
-//       // emit XOR'd output to eq->trees[0] / eq->edata.nslots[1]
-//   }
-//
-// Validation: must produce IDENTICAL output to djezo's digit_1 (same bucket
-// layout, same atomic ordering for nslots[1]). Some atomicAdd order non-determinism
-// is acceptable — what we compare is the SET of slots in each bucket, not order.
-//
-// Estimated time: 3-5 days for first cut, 1-2 weeks to debug to bit-match.
+// Algorithm:
+//   1. Load my block's bucket slots from global -> shared lastword1/lastword2
+//   2. Compute xhash for each slot, insert into ht[xhash] collision chain
+//   3. For each slot, find collisions (same xhash). Process first collision
+//      inline; push remaining collision pairs to the pairs list.
+//   4. Drain pairs list cooperatively (all 512 threads), producing XOR'd
+//      output slots in eq->trees[0][xorbucketid][xorslot].
 
-__global__ void digit_1_kernel(equi_state* eq) {
-    // TODO(phase0): implement producer/consumer pipeline
+// packer_default::set_bucketid_and_slots, inlined with RB=8 compile-time constant.
+// SLOTBITS for RB=8 is 10, so fields layout: [bucketid:12][s0:10][s1:10]
+__device__ __forceinline__
+u32 pack_bid_s0_s1(u32 bucketid, u32 s0, u32 s1) {
+    // matches packer_default::set_bucketid_and_slots(bid, s0, s1, 8, 640)
+    // which is (((bid << SLOTBITS) | s0) << SLOTBITS) | s1  with SLOTBITS=10
+    return (((bucketid << 10) | s0) << 10) | s1;
+}
+
+// Compile-time MAXPAIRS for digit_1: djezo uses 4*NRESTS = 4*256 = 1024
+static constexpr u32 D1_MAXPAIRS = 4u * NRESTS;
+
+__global__ __launch_bounds__(512, 2)
+void digit_1_kernel(equi_state* eq) {
+    constexpr int  SSM_LOCAL  = 12;
+    constexpr u32  THR        = 512;
+    constexpr u32  MAXPAIRS   = D1_MAXPAIRS;
+
+    __shared__ u16   ht[256][SSM_LOCAL - 1];
+    __shared__ uint2 lastword1[RB8_NSLOTS];
+    __shared__ uint4 lastword2[RB8_NSLOTS];
+    __shared__ int   ht_len[MAXPAIRS];
+    __shared__ u32   pairs_len;
+    __shared__ u32   next_pair;
+
+    const u32 threadid = threadIdx.x;
+    const u32 bucketid = blockIdx.x;
+
+    // Reset shared: one thread per ht[] entry (only use first 256), plus scalars.
+    if (threadid < 256)
+        ht_len[threadid] = 0;
+    else if (threadid == (THR - 1))
+        pairs_len = 0;
+    else if (threadid == (THR - 33))
+        next_pair = 0;
+
+    const u32 bsize = min(eq->edata.nslots0[bucketid], (u32)RB8_NSLOTS);
+
+    u32   hr[2];
+    int   pos[2];
+    pos[0] = pos[1] = SSM_LOCAL;
+    uint2 ta[2];
+    uint4 tb[2];
+    u32   si[2];
+
+    __syncthreads();  // shared-memory init visible
+
+    // --- Phase 1: load my slots, compute xhash, insert into HT ----------------
+    #pragma unroll
+    for (u32 i = 0; i != 2; ++i) {
+        si[i] = i * THR + threadid;
+        if (si[i] >= bsize) break;
+
+        const slot* pslot1 = eq->round0trees[bucketid] + si[i];
+        uint4 a1 = *(uint4*)(&pslot1->hash[0]);
+        uint2 a2 = *(uint2*)(&pslot1->hash[4]);
+        ta[i].x = a1.x; ta[i].y = a1.y;
+        lastword1[si[i]] = ta[i];
+        tb[i].x = a1.z; tb[i].y = a1.w;
+        tb[i].z = a2.x; tb[i].w = a2.y;
+        lastword2[si[i]] = tb[i];
+
+        // xhash = bits [20..28) of ta[i].x (BFE width 8, start 20)
+        hr[i] = (ta[i].x >> 20) & 0xFFu;
+        pos[i] = atomicAdd(&ht_len[hr[i]], 1);
+        if (pos[i] < (SSM_LOCAL - 1))
+            ht[hr[i]][pos[i]] = (u16)si[i];
+    }
+
+    __syncthreads();
+    int* pairs = ht_len;  // reuse ht_len as the pairs list (matches djezo)
+
+    u32 xors[6];
+    u32 xorbucketid, xorslot;
+
+    // --- Phase 2: for each of my slots, resolve first collision and push rest --
+    #pragma unroll
+    for (u32 i = 0; i != 2; ++i) {
+        if (pos[i] >= SSM_LOCAL) continue;
+
+        if (pos[i] > 0) {
+            u16 p = ht[hr[i]][0];
+            *(uint2*)(&xors[0]) = make_uint2(ta[i].x ^ lastword1[p].x,
+                                              ta[i].y ^ lastword1[p].y);
+            // xorbucketid = bits[RB..RB+BUCKBITS) of xors[0] = bits[8..20)
+            xorbucketid = (xors[0] >> 8) & BUCKMASK;
+            xorslot = atomicAdd(&eq->edata.nslots[1][xorbucketid], 1);
+
+            if (xorslot < NSLOTS) {
+                uint4 l2p = lastword2[p];
+                uint4 l2s = tb[i];
+                xors[2] = l2s.x ^ l2p.x;
+                xors[3] = l2s.y ^ l2p.y;
+                xors[4] = l2s.z ^ l2p.z;
+                xors[5] = l2s.w ^ l2p.w;
+
+                slot& xs = eq->trees[0][xorbucketid][xorslot];
+                *(uint4*)(&xs.hash[0]) = make_uint4(xors[1], xors[2], xors[3], xors[4]);
+                uint4 ttx;
+                ttx.x = xors[5];
+                ttx.y = xors[0];
+                ttx.z = pack_bid_s0_s1(bucketid, si[i], p);
+                ttx.w = 0;
+                *(uint4*)(&xs.hash[4]) = ttx;
+            }
+
+            // Push remaining collisions to the pairs list for cooperative drain
+            for (int k = 1; k != pos[i]; ++k) {
+                u32 pindex = atomicAdd(&pairs_len, 1);
+                if (pindex >= MAXPAIRS) break;
+                u16 prev = ht[hr[i]][k];
+                pairs[pindex] = (int)__byte_perm(si[i], prev, 0x1054);
+            }
+        }
+    }
+
+    __syncthreads();
+
+    // --- Phase 3: cooperative drain of the pairs list -------------------------
+    u32 plen = min(pairs_len, MAXPAIRS);
+    u32 ii, kk;
+    for (u32 s = atomicAdd(&next_pair, 1); s < plen; s = atomicAdd(&next_pair, 1)) {
+        int pair = pairs[s];
+        ii = __byte_perm(pair, 0, 0x4510);
+        kk = __byte_perm(pair, 0, 0x4532);
+
+        uint2 lw1i = lastword1[ii];
+        uint2 lw1k = lastword1[kk];
+        xors[0] = lw1i.x ^ lw1k.x;
+        xors[1] = lw1i.y ^ lw1k.y;
+
+        xorbucketid = (xors[0] >> 8) & BUCKMASK;
+        xorslot = atomicAdd(&eq->edata.nslots[1][xorbucketid], 1);
+
+        if (xorslot < NSLOTS) {
+            uint4 l2i = lastword2[ii];
+            uint4 l2k = lastword2[kk];
+            xors[2] = l2i.x ^ l2k.x;
+            xors[3] = l2i.y ^ l2k.y;
+            xors[4] = l2i.z ^ l2k.z;
+            xors[5] = l2i.w ^ l2k.w;
+
+            slot& xs = eq->trees[0][xorbucketid][xorslot];
+            *(uint4*)(&xs.hash[0]) = make_uint4(xors[1], xors[2], xors[3], xors[4]);
+            uint4 ttx;
+            ttx.x = xors[5];
+            ttx.y = xors[0];
+            ttx.z = pack_bid_s0_s1(bucketid, ii, kk);
+            ttx.w = 0;
+            *(uint4*)(&xs.hash[4]) = ttx;
+        }
+    }
 }
 
 // ============================================================================
@@ -158,8 +297,10 @@ void launch_digit_first(equi_state* device_eq, uint32_t nonce, cudaStream_t stre
 }
 
 void launch_digit_1(equi_state* device_eq, cudaStream_t stream) {
-    // Phase 0 stub — launch config TBD when kernel body is implemented.
-    constexpr u32 grid_blocks = 4096;   // matches djezo's <<<4096, 512>>>
+    // One block per bucket, 512 threads each. Each thread handles up to 2 slots
+    // from round0trees, for up to 1024 slot-indices per block (cut off at bsize
+    // which maxes at RB8_NSLOTS=640).
+    constexpr u32 grid_blocks = NBUCKETS;   // 4096 for RB=8 / CONFIG_MODE_2
     constexpr u32 threads_per_block = 512;
     digit_1_kernel<<<grid_blocks, threads_per_block, 0, stream>>>(device_eq);
 }

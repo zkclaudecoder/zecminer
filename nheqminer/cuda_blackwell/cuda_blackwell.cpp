@@ -8,10 +8,45 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <cstring>
 #include "cuda_runtime.h"
 
 #include "cuda_blackwell.hpp"
 #include "eq_context.hpp"
+#include "../cpu_tromp/blake2/blake2.h"
+
+// Match djezo/bw Equihash parameters (MUST stay in sync with bucket_layout.hpp)
+static constexpr uint32_t WN_ = 200;
+static constexpr uint32_t WK_ = 9;
+static constexpr uint32_t HASHOUT_ = (512 / WN_) * WN_ / 8;  // 50
+
+// Port of djezo's setheader(). Given the job's header bytes and a nonce,
+// produces the blake2b_state that our digit_first_kernel folds the block index
+// into on the device.
+static void bw_setheader(blake2b_state* ctx,
+                         const char* header, uint32_t header_len,
+                         const char* nce, uint32_t nonce_len) {
+    uint32_t le_N = WN_;
+    uint32_t le_K = WK_;
+    unsigned char personal[] = "ZcashPoW01230123";
+    std::memcpy(personal + 8, &le_N, 4);
+    std::memcpy(personal + 12, &le_K, 4);
+    blake2b_param P[1];
+    P->digest_length = HASHOUT_;
+    P->key_length = 0;
+    P->fanout = 1;
+    P->depth = 1;
+    P->leaf_length = 0;
+    P->node_offset = 0;
+    P->node_depth = 0;
+    P->inner_length = 0;
+    std::memset(P->reserved, 0, sizeof(P->reserved));
+    std::memset(P->salt,     0, sizeof(P->salt));
+    std::memcpy(P->personal, (const uint8_t*)personal, 16);
+    blake2b_init_param(ctx, P);
+    blake2b_update(ctx, (const unsigned char*)header, header_len);
+    blake2b_update(ctx, (const unsigned char*)nce,    nonce_len);
+}
 
 // ===== eq_cuda_context_blackwell =====
 
@@ -32,22 +67,53 @@ eq_cuda_context_blackwell::~eq_cuda_context_blackwell() {
 }
 
 void eq_cuda_context_blackwell::solve(
-    const char* /*header*/, unsigned int /*header_len*/,
-    const char* /*nonce*/, unsigned int /*nonce_len*/,
+    const char* header, unsigned int header_len,
+    const char* nonce, unsigned int nonce_len,
     std::function<bool()> /*cancelf*/,
     std::function<void(const std::vector<uint32_t>&, size_t, const unsigned char*)> /*solutionf*/,
     std::function<void(void)> hashdonef)
 {
-    // TODO(phase0): implement the actual solve loop:
-    //   1. setheader(...) on host  -> blake_h state
-    //   2. cudaMemcpy blake_h -> device_eq->blake_h
-    //   3. cudaMemset device_eq->edata
-    //   4. launch_digit_first(device_eq, 0, stream)
-    //   5. launch_digit_1(device_eq, stream)        // currently a no-op
-    //   6. cudaStreamSynchronize(stream)
-    //
-    // Phase 1+ adds: digit_2..digit_8, digit_last_wdc, solution extraction,
-    //               solutionf() callback per valid solution found.
+    // Phase 0: run digit_first + digit_1 and report bucket stats. No solutions
+    // are emitted yet (digit_2..digit_8 and digit_last_wdc still unimplemented).
+    // Use DJEZO_BW_VERBOSE=1 in env to see the per-iteration stats for debugging.
+
+    blake2b_state ctx;
+    bw_setheader(&ctx, header, header_len, nonce, nonce_len);
+
+    checkCudaErrorsBW(cudaMemcpyAsync(&device_eq->blake_h, &ctx.h,
+                                       sizeof(uint64_t) * 8,
+                                       cudaMemcpyHostToDevice, stream));
+    checkCudaErrorsBW(cudaMemsetAsync(&device_eq->edata, 0,
+                                       sizeof(device_eq->edata), stream));
+
+    bw::launch_digit_first(device_eq, /*nonce_suffix=*/0, stream);
+    bw::launch_digit_1(device_eq, stream);
+
+    static const bool verbose = std::getenv("DJEZO_BW_VERBOSE") != nullptr;
+    if (verbose) {
+        // Pull back the round-1 slot-count array so we can sanity-check the output
+        uint32_t nslots1[bw::NBUCKETS];
+        checkCudaErrorsBW(cudaMemcpyAsync(nslots1, &device_eq->edata.nslots[1],
+                                           sizeof(nslots1), cudaMemcpyDeviceToHost, stream));
+        checkCudaErrorsBW(cudaStreamSynchronize(stream));
+
+        uint64_t total = 0, min_v = ~0ULL, max_v = 0, nonempty = 0;
+        for (uint32_t i = 0; i < bw::NBUCKETS; ++i) {
+            total += nslots1[i];
+            if (nslots1[i] < min_v) min_v = nslots1[i];
+            if (nslots1[i] > max_v) max_v = nslots1[i];
+            if (nslots1[i] > 0) ++nonempty;
+        }
+        std::cerr << "[BW] round-1 nslots: total=" << total
+                  << " mean=" << (double)total / bw::NBUCKETS
+                  << " min=" << min_v
+                  << " max=" << max_v
+                  << " nonempty=" << nonempty << "/" << bw::NBUCKETS
+                  << std::endl;
+    } else {
+        checkCudaErrorsBW(cudaStreamSynchronize(stream));
+    }
+
     hashdonef();
 }
 

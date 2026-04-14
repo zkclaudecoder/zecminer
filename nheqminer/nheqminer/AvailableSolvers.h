@@ -24,6 +24,11 @@ CREATE_SOLVER_STUB(cuda_tromp, "cuda_tromp_STUB")
 #else
 CREATE_SOLVER_STUB(cuda_djezo, "cuda_djezo_STUB")
 #endif
+#ifdef USE_CUDA_BLACKWELL
+#include "../cuda_blackwell/cuda_blackwell.hpp"
+#else
+CREATE_SOLVER_STUB(cuda_blackwell, "cuda_blackwell_STUB")
+#endif
 // OpenCL solvers are fropped replace with new OS solvers
 #ifdef USE_OCL_XMP
 #include "../ocl_xpm/ocl_xmp.hpp"
@@ -68,6 +73,18 @@ public:
 		}
 	}
 	virtual ~CUDASolverDjezo() {}
+};
+class CUDASolverBlackwell : public Solver<cuda_blackwell> {
+public:
+	CUDASolverBlackwell(int dev_id, int blocks, int threadsperblock) : Solver<cuda_blackwell>(new cuda_blackwell(0, dev_id), SolverType::CUDA) {
+		if (blocks > 0) {
+			_context->blocks = blocks;
+		}
+		if (threadsperblock > 0) {
+			_context->threadsperblock = threadsperblock;
+		}
+	}
+	virtual ~CUDASolverBlackwell() {}
 };
 class CUDASolverTromp : public Solver<cuda_tromp> {
 public:

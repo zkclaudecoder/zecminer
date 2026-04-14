@@ -89,7 +89,7 @@ void print_help()
 	std::cout << std::endl;
 	std::cout << "NVIDIA CUDA settings" << std::endl;
 	std::cout << "\t-ci\t\tCUDA info" << std::endl;
-	std::cout << "\t-cv [ver]\tSet CUDA solver (0 = djeZo, 1 = tromp)" << std::endl;
+	std::cout << "\t-cv [ver]\tSet CUDA solver (0 = djeZo, 1 = tromp, 2 = blackwell [experimental])" << std::endl;
 	std::cout << "\t-cd [devices]\tEnable CUDA mining on spec. devices" << std::endl;
 	std::cout << "\t-cb [blocks]\tNumber of blocks" << std::endl;
 	std::cout << "\t-ct [tpb]\tNumber of threads per block" << std::endl;
@@ -450,7 +450,7 @@ int main(int argc, char* argv[])
 
 	try
 	{
-		_MinerFactory = new MinerFactory(use_avx == 1, use_old_cuda == 0, use_old_xmp == 0);
+		_MinerFactory = new MinerFactory(use_avx == 1, use_old_cuda == 0, use_old_xmp == 0, use_old_cuda == 2);
 		if (!benchmark)
 		{
 			if (user.length() == 0)

@@ -72,6 +72,10 @@ ISolver * MinerFactory::GenCPUSolver(int use_opt) {
 }
 
 ISolver * MinerFactory::GenCUDASolver(int dev_id, int blocks, int threadsperblock) {
+	if (_use_cuda_blackwell) {
+		_solvers.push_back(new CUDASolverBlackwell(dev_id, blocks, threadsperblock));
+		return _solvers.back();
+	}
 	if (_use_cuda_djezo) {
 		_solvers.push_back(new CUDASolverDjezo(dev_id, blocks, threadsperblock));
 		return _solvers.back();

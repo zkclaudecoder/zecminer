@@ -54,7 +54,7 @@ struct eq_cuda_context_blackwell_interface {
                        const char* nonce, unsigned int nonce_len,
                        std::function<bool()> cancelf,
                        std::function<void(const std::vector<uint32_t>&, size_t, const unsigned char*)> solutionf,
-                       std::function<void(void)> hashdonef);
+                       std::function<void(void)> hashdonef) = 0;
 };
 
 struct eq_cuda_context_blackwell : public eq_cuda_context_blackwell_interface {
