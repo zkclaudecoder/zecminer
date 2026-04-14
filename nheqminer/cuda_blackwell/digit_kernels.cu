@@ -288,6 +288,483 @@ void digit_1_kernel(equi_state* eq) {
 }
 
 // ============================================================================
+// digit_2_kernel — Phase 1: algorithmic port of djezo's digit_2
+// ============================================================================
+// Reads: eq->trees[0][bucketid]             (slot — 8 u32s)
+// Writes: eq->round2trees[xorbid].treessmall[xorslot] (slotsmall — 4 u32s)
+//         eq->round2trees[xorbid].treestiny[xorslot]  (slottiny — 2 u32s)
+// xhash: bits of the 6th hash word (tty.y & RESTMASK)
+// Launch: <<<NBUCKETS, THREADS=512>>>
+
+static constexpr u32 D2_MAXPAIRS = 4u * NRESTS;
+
+__device__ __forceinline__
+u32 packer_xor_bucketid_d2(u32 xor0) {
+    // xorbucketid = xors[0] >> (12 + RB)   for RB=8 -> >> 20
+    return xor0 >> (12 + RB);
+}
+
+__global__ __launch_bounds__(512, 2)
+void digit_2_kernel(equi_state* eq) {
+    constexpr int SSM_LOCAL = 12;
+    constexpr u32 THR       = 512;
+    constexpr u32 MAXPAIRS  = D2_MAXPAIRS;
+
+    __shared__ u16   ht[NRESTS][SSM_LOCAL - 1];
+    __shared__ u32   lastword1[NSLOTS];
+    __shared__ uint4 lastword2[NSLOTS];
+    __shared__ int   ht_len[NRESTS];
+    __shared__ int   pairs[MAXPAIRS];
+    __shared__ u32   pairs_len;
+    __shared__ u32   next_pair;
+
+    const u32 threadid = threadIdx.x;
+    const u32 bucketid = blockIdx.x;
+
+    if (threadid < NRESTS)
+        ht_len[threadid] = 0;
+    else if (threadid == (THR - 1))
+        pairs_len = 0;
+    else if (threadid == (THR - 33))
+        next_pair = 0;
+
+    slot* buck = eq->trees[0][bucketid];
+    const u32 bsize = min(eq->edata.nslots[1][bucketid], (u32)NSLOTS);
+
+    u32   hr[2];
+    int   pos[2]; pos[0] = pos[1] = SSM_LOCAL;
+    u32   ta[2];
+    uint4 tt[2];
+    u32   si[2];
+
+    __syncthreads();
+
+    #pragma unroll
+    for (u32 i = 0; i != 2; ++i) {
+        si[i] = i * THR + threadid;
+        if (si[i] >= bsize) break;
+        const slot* pslot1 = buck + si[i];
+        uint4 ttx = *(uint4*)(&pslot1->hash[0]);
+        lastword1[si[i]] = ta[i] = ttx.x;
+        uint2 tty = *(uint2*)(&pslot1->hash[4]);
+        tt[i].x = ttx.y; tt[i].y = ttx.z; tt[i].z = ttx.w; tt[i].w = tty.x;
+        lastword2[si[i]] = tt[i];
+        hr[i] = tty.y & RESTMASK;
+        pos[i] = atomicAdd(&ht_len[hr[i]], 1);
+        if (pos[i] < (SSM_LOCAL - 1))
+            ht[hr[i]][pos[i]] = (u16)si[i];
+    }
+    __syncthreads();
+
+    u32 xors[5];
+    u32 xorbucketid, xorslot;
+
+    #pragma unroll
+    for (u32 i = 0; i != 2; ++i) {
+        if (pos[i] >= SSM_LOCAL) continue;
+        if (pos[i] > 0) {
+            u16 p = ht[hr[i]][0];
+            xors[0] = ta[i] ^ lastword1[p];
+            xorbucketid = packer_xor_bucketid_d2(xors[0]);
+            xorslot = atomicAdd(&eq->edata.nslots[2][xorbucketid], 1);
+            if (xorslot < NSLOTS) {
+                uint4 l2p = lastword2[p];
+                xors[1] = tt[i].x ^ l2p.x;
+                xors[2] = tt[i].y ^ l2p.y;
+                xors[3] = tt[i].z ^ l2p.z;
+                xors[4] = tt[i].w ^ l2p.w;
+                slotsmall& xs = eq->round2trees[xorbucketid].treessmall[xorslot];
+                *(uint4*)(&xs.hash[0]) = make_uint4(xors[0], xors[1], xors[2], xors[3]);
+                slottiny& xst = eq->round2trees[xorbucketid].treestiny[xorslot];
+                *(uint2*)(&xst.hash[0]) = make_uint2(xors[4], pack_bid_s0_s1(bucketid, si[i], p));
+            }
+            for (int k = 1; k != pos[i]; ++k) {
+                u32 pindex = atomicAdd(&pairs_len, 1);
+                if (pindex >= MAXPAIRS) break;
+                u16 prev = ht[hr[i]][k];
+                pairs[pindex] = (int)__byte_perm(si[i], prev, 0x1054);
+            }
+        }
+    }
+    __syncthreads();
+
+    u32 plen = min(pairs_len, MAXPAIRS);
+    u32 ii, kk;
+    for (u32 s = atomicAdd(&next_pair, 1); s < plen; s = atomicAdd(&next_pair, 1)) {
+        int pair = pairs[s];
+        ii = __byte_perm(pair, 0, 0x4510);
+        kk = __byte_perm(pair, 0, 0x4532);
+        xors[0] = lastword1[ii] ^ lastword1[kk];
+        xorbucketid = packer_xor_bucketid_d2(xors[0]);
+        xorslot = atomicAdd(&eq->edata.nslots[2][xorbucketid], 1);
+        if (xorslot < NSLOTS) {
+            uint4 l2i = lastword2[ii];
+            uint4 l2k = lastword2[kk];
+            xors[1] = l2i.x ^ l2k.x;
+            xors[2] = l2i.y ^ l2k.y;
+            xors[3] = l2i.z ^ l2k.z;
+            xors[4] = l2i.w ^ l2k.w;
+            slotsmall& xs = eq->round2trees[xorbucketid].treessmall[xorslot];
+            *(uint4*)(&xs.hash[0]) = make_uint4(xors[0], xors[1], xors[2], xors[3]);
+            slottiny& xst = eq->round2trees[xorbucketid].treestiny[xorslot];
+            *(uint2*)(&xst.hash[0]) = make_uint2(xors[4], pack_bid_s0_s1(bucketid, ii, kk));
+        }
+    }
+}
+
+// ============================================================================
+// digit_3_kernel — Phase 1: port of djezo's digit_3
+// ============================================================================
+// Reads: eq->round2trees[bucketid].treessmall (uint4) + .treestiny (u32)
+// Writes: eq->round3trees[xorbid].treessmall + .treestiny
+// xhash: SAFE_BFE(hr, tt.x, 12, RB) = bits[12..12+RB] of the first hash word
+
+static constexpr u32 D3_MAXPAIRS = 4u * NRESTS;
+
+__global__ __launch_bounds__(512, 2)
+void digit_3_kernel(equi_state* eq) {
+    constexpr int SSM_LOCAL = 12;
+    constexpr u32 THR       = 512;
+    constexpr u32 MAXPAIRS  = D3_MAXPAIRS;
+
+    __shared__ u16   ht[NRESTS][SSM_LOCAL - 1];
+    __shared__ uint4 lastword1[NSLOTS];
+    __shared__ u32   lastword2[NSLOTS];
+    __shared__ int   ht_len[NRESTS];
+    __shared__ int   pairs[MAXPAIRS];
+    __shared__ u32   pairs_len;
+    __shared__ u32   next_pair;
+
+    const u32 threadid = threadIdx.x;
+    const u32 bucketid = blockIdx.x;
+
+    if (threadid < NRESTS)
+        ht_len[threadid] = 0;
+    else if (threadid == (THR - 1))
+        pairs_len = 0;
+    else if (threadid == (THR - 33))
+        next_pair = 0;
+
+    const u32 bsize = min(eq->edata.nslots[2][bucketid], (u32)NSLOTS);
+
+    u32   hr[2];
+    int   pos[2]; pos[0] = pos[1] = SSM_LOCAL;
+    u32   si[2];
+    uint4 tt[2];
+    u32   ta[2];
+
+    __syncthreads();
+
+    #pragma unroll
+    for (u32 i = 0; i != 2; ++i) {
+        si[i] = i * THR + threadid;
+        if (si[i] >= bsize) break;
+        slotsmall& xs  = eq->round2trees[bucketid].treessmall[si[i]];
+        slottiny&  xst = eq->round2trees[bucketid].treestiny[si[i]];
+        tt[i] = *(uint4*)(&xs.hash[0]);
+        lastword1[si[i]] = tt[i];
+        ta[i] = xst.hash[0];
+        lastword2[si[i]] = ta[i];
+        hr[i] = (tt[i].x >> 12) & RESTMASK;   // SAFE_BFE(_, tt.x, 12, RB) w/ RB=8
+        pos[i] = atomicAdd(&ht_len[hr[i]], 1);
+        if (pos[i] < (SSM_LOCAL - 1))
+            ht[hr[i]][pos[i]] = (u16)si[i];
+    }
+    __syncthreads();
+
+    u32 xors[5];
+    u32 bexor, xorbucketid, xorslot;
+
+    #pragma unroll
+    for (u32 i = 0; i != 2; ++i) {
+        if (pos[i] >= SSM_LOCAL) continue;
+        if (pos[i] > 0) {
+            u16 p = ht[hr[i]][0];
+            xors[4] = ta[i] ^ lastword2[p];
+            if (xors[4] != 0) {
+                uint4 l1p = lastword1[p];
+                xors[0] = tt[i].x ^ l1p.x;
+                xors[1] = tt[i].y ^ l1p.y;
+                xors[2] = tt[i].z ^ l1p.z;
+                xors[3] = tt[i].w ^ l1p.w;
+                bexor = __byte_perm(xors[0], xors[1], 0x2107);
+                xorbucketid = (bexor >> RB) & BUCKMASK;
+                xorslot = atomicAdd(&eq->edata.nslots[3][xorbucketid], 1);
+                if (xorslot < NSLOTS) {
+                    slotsmall& xs  = eq->round3trees[xorbucketid].treessmall[xorslot];
+                    *(uint4*)(&xs.hash[0]) = make_uint4(xors[1], xors[2], xors[3], xors[4]);
+                    slottiny&  xst = eq->round3trees[xorbucketid].treestiny[xorslot];
+                    *(uint2*)(&xst.hash[0]) = make_uint2(bexor, pack_bid_s0_s1(bucketid, si[i], p));
+                }
+            }
+            for (int k = 1; k != pos[i]; ++k) {
+                u32 pindex = atomicAdd(&pairs_len, 1);
+                if (pindex >= MAXPAIRS) break;
+                u16 prev = ht[hr[i]][k];
+                pairs[pindex] = (int)__byte_perm(si[i], prev, 0x1054);
+            }
+        }
+    }
+    __syncthreads();
+
+    u32 plen = min(pairs_len, MAXPAIRS);
+    u32 ii, kk;
+    for (u32 s = atomicAdd(&next_pair, 1); s < plen; s = atomicAdd(&next_pair, 1)) {
+        int pair = pairs[s];
+        ii = __byte_perm(pair, 0, 0x4510);
+        kk = __byte_perm(pair, 0, 0x4532);
+        xors[4] = lastword2[ii] ^ lastword2[kk];
+        if (xors[4] != 0) {
+            uint4 l1i = lastword1[ii];
+            uint4 l1k = lastword1[kk];
+            xors[0] = l1i.x ^ l1k.x;
+            xors[1] = l1i.y ^ l1k.y;
+            xors[2] = l1i.z ^ l1k.z;
+            xors[3] = l1i.w ^ l1k.w;
+            bexor = __byte_perm(xors[0], xors[1], 0x2107);
+            xorbucketid = (bexor >> RB) & BUCKMASK;
+            xorslot = atomicAdd(&eq->edata.nslots[3][xorbucketid], 1);
+            if (xorslot < NSLOTS) {
+                slotsmall& xs  = eq->round3trees[xorbucketid].treessmall[xorslot];
+                *(uint4*)(&xs.hash[0]) = make_uint4(xors[1], xors[2], xors[3], xors[4]);
+                slottiny&  xst = eq->round3trees[xorbucketid].treestiny[xorslot];
+                *(uint2*)(&xst.hash[0]) = make_uint2(bexor, pack_bid_s0_s1(bucketid, ii, kk));
+            }
+        }
+    }
+}
+
+// ============================================================================
+// digit_4_kernel — port of djezo's digit_4
+// ============================================================================
+// Reads: eq->round3trees[bucketid].treessmall (uint4) + .treestiny (u32)
+// Writes: eq->treessmall[3][xorbucketid][xorslot] (uint4)
+//         eq->round4bidandsids[xorbucketid][xorslot] (u32)
+// xhash: xst.hash[0] & RESTMASK
+
+static constexpr u32 D4_MAXPAIRS = 4u * NRESTS;
+
+__global__ __launch_bounds__(512, 2)
+void digit_4_kernel(equi_state* eq) {
+    constexpr int SSM_LOCAL = 12;
+    constexpr u32 THR       = 512;
+    constexpr u32 MAXPAIRS  = D4_MAXPAIRS;
+
+    __shared__ u16   ht[NRESTS][SSM_LOCAL - 1];
+    __shared__ uint4 lastword[NSLOTS];
+    __shared__ int   ht_len[NRESTS];
+    __shared__ int   pairs[MAXPAIRS];
+    __shared__ u32   pairs_len;
+    __shared__ u32   next_pair;
+
+    const u32 threadid = threadIdx.x;
+    const u32 bucketid = blockIdx.x;
+
+    if (threadid < NRESTS)
+        ht_len[threadid] = 0;
+    else if (threadid == (THR - 1))
+        pairs_len = 0;
+    else if (threadid == (THR - 33))
+        next_pair = 0;
+
+    const u32 bsize = min(eq->edata.nslots[3][bucketid], (u32)NSLOTS);
+
+    u32   hr[2];
+    int   pos[2]; pos[0] = pos[1] = SSM_LOCAL;
+    u32   si[2];
+    uint4 tt[2];
+
+    __syncthreads();
+
+    #pragma unroll
+    for (u32 i = 0; i != 2; ++i) {
+        si[i] = i * THR + threadid;
+        if (si[i] >= bsize) break;
+        slotsmall& xs  = eq->round3trees[bucketid].treessmall[si[i]];
+        slottiny&  xst = eq->round3trees[bucketid].treestiny[si[i]];
+        tt[i] = *(uint4*)(&xs.hash[0]);
+        lastword[si[i]] = tt[i];
+        hr[i] = xst.hash[0] & RESTMASK;
+        pos[i] = atomicAdd(&ht_len[hr[i]], 1);
+        if (pos[i] < (SSM_LOCAL - 1))
+            ht[hr[i]][pos[i]] = (u16)si[i];
+    }
+    __syncthreads();
+
+    u32 xors[4];
+    u32 xorbucketid, xorslot;
+
+    #pragma unroll
+    for (u32 i = 0; i != 2; ++i) {
+        if (pos[i] >= SSM_LOCAL) continue;
+        if (pos[i] > 0) {
+            u16 p = ht[hr[i]][0];
+            uint4 lp = lastword[p];
+            xors[0] = tt[i].x ^ lp.x;
+            xors[1] = tt[i].y ^ lp.y;
+            xors[2] = tt[i].z ^ lp.z;
+            xors[3] = tt[i].w ^ lp.w;
+            if (xors[3] != 0) {
+                // xorbucketid = SAFE_BFE(xors[0], 4+RB, BUCKBITS) = bits[12..24] for RB=8
+                xorbucketid = (xors[0] >> (4 + RB)) & BUCKMASK;
+                xorslot = atomicAdd(&eq->edata.nslots[4][xorbucketid], 1);
+                if (xorslot < NSLOTS) {
+                    slotsmall& xs = eq->treessmall[3][xorbucketid][xorslot];
+                    *(uint4*)(&xs.hash[0]) = make_uint4(xors[0], xors[1], xors[2], xors[3]);
+                    eq->round4bidandsids[xorbucketid][xorslot] = pack_bid_s0_s1(bucketid, si[i], p);
+                }
+            }
+            for (int k = 1; k != pos[i]; ++k) {
+                u32 pindex = atomicAdd(&pairs_len, 1);
+                if (pindex >= MAXPAIRS) break;
+                u16 prev = ht[hr[i]][k];
+                pairs[pindex] = (int)__byte_perm(si[i], prev, 0x1054);
+            }
+        }
+    }
+    __syncthreads();
+
+    u32 plen = min(pairs_len, MAXPAIRS);
+    u32 ii, kk;
+    for (u32 s = atomicAdd(&next_pair, 1); s < plen; s = atomicAdd(&next_pair, 1)) {
+        int pair = pairs[s];
+        ii = __byte_perm(pair, 0, 0x4510);
+        kk = __byte_perm(pair, 0, 0x4532);
+        uint4 li = lastword[ii];
+        uint4 lk = lastword[kk];
+        xors[0] = li.x ^ lk.x;
+        xors[1] = li.y ^ lk.y;
+        xors[2] = li.z ^ lk.z;
+        xors[3] = li.w ^ lk.w;
+        if (xors[3] != 0) {
+            xorbucketid = (xors[0] >> (4 + RB)) & BUCKMASK;
+            xorslot = atomicAdd(&eq->edata.nslots[4][xorbucketid], 1);
+            if (xorslot < NSLOTS) {
+                slotsmall& xs = eq->treessmall[3][xorbucketid][xorslot];
+                *(uint4*)(&xs.hash[0]) = make_uint4(xors[0], xors[1], xors[2], xors[3]);
+                eq->round4bidandsids[xorbucketid][xorslot] = pack_bid_s0_s1(bucketid, ii, kk);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// digit_5_kernel — port of djezo's digit_5
+// ============================================================================
+// Reads: eq->treessmall[3][bucketid] (slotsmall)
+// Writes: eq->treessmall[2][xorbucketid][xorslot] (slotsmall)
+// xhash: SAFE_BFE(hr, tt.x, 4, RB) = bits[4..12] for RB=8
+// bexor = __byte_perm(xors[0], xors[1], 0x1076)
+// xorbucketid = SAFE_BFE(_, bexor, RB, BUCKBITS) = bits[8..20] for RB=8
+
+static constexpr u32 D5_MAXPAIRS = 4u * NRESTS;
+
+__global__ __launch_bounds__(512, 2)
+void digit_5_kernel(equi_state* eq) {
+    constexpr int SSM_LOCAL = 12;
+    constexpr u32 THR       = 512;
+    constexpr u32 MAXPAIRS  = D5_MAXPAIRS;
+
+    __shared__ u16   ht[NRESTS][SSM_LOCAL - 1];
+    __shared__ uint4 lastword[NSLOTS];
+    __shared__ int   ht_len[NRESTS];
+    __shared__ int   pairs[MAXPAIRS];
+    __shared__ u32   pairs_len;
+    __shared__ u32   next_pair;
+
+    const u32 threadid = threadIdx.x;
+    const u32 bucketid = blockIdx.x;
+
+    if (threadid < NRESTS)
+        ht_len[threadid] = 0;
+    else if (threadid == (THR - 1))
+        pairs_len = 0;
+    else if (threadid == (THR - 33))
+        next_pair = 0;
+
+    slotsmall* buck = eq->treessmall[3][bucketid];
+    const u32 bsize = min(eq->edata.nslots[4][bucketid], (u32)NSLOTS);
+
+    u32   hr[2];
+    int   pos[2]; pos[0] = pos[1] = SSM_LOCAL;
+    u32   si[2];
+    uint4 tt[2];
+
+    __syncthreads();
+
+    #pragma unroll
+    for (u32 i = 0; i != 2; ++i) {
+        si[i] = i * THR + threadid;
+        if (si[i] >= bsize) break;
+        const slotsmall* pslot1 = buck + si[i];
+        tt[i] = *(uint4*)(&pslot1->hash[0]);
+        lastword[si[i]] = tt[i];
+        hr[i] = (tt[i].x >> 4) & RESTMASK;  // SAFE_BFE(_, tt.x, 4, RB) for RB=8
+        pos[i] = atomicAdd(&ht_len[hr[i]], 1);
+        if (pos[i] < (SSM_LOCAL - 1))
+            ht[hr[i]][pos[i]] = (u16)si[i];
+    }
+    __syncthreads();
+
+    u32 xors[4];
+    u32 bexor, xorbucketid, xorslot;
+
+    #pragma unroll
+    for (u32 i = 0; i != 2; ++i) {
+        if (pos[i] >= SSM_LOCAL) continue;
+        if (pos[i] > 0) {
+            u16 p = ht[hr[i]][0];
+            uint4 lp = lastword[p];
+            xors[0] = tt[i].x ^ lp.x;
+            xors[1] = tt[i].y ^ lp.y;
+            xors[2] = tt[i].z ^ lp.z;
+            xors[3] = tt[i].w ^ lp.w;
+            if (xors[3] != 0) {
+                bexor = __byte_perm(xors[0], xors[1], 0x1076);
+                xorbucketid = (bexor >> RB) & BUCKMASK;
+                xorslot = atomicAdd(&eq->edata.nslots[5][xorbucketid], 1);
+                if (xorslot < NSLOTS) {
+                    slotsmall& xs = eq->treessmall[2][xorbucketid][xorslot];
+                    *(uint4*)(&xs.hash[0]) = make_uint4(xors[1], xors[2], xors[3],
+                                                         pack_bid_s0_s1(bucketid, si[i], p));
+                }
+            }
+            for (int k = 1; k != pos[i]; ++k) {
+                u32 pindex = atomicAdd(&pairs_len, 1);
+                if (pindex >= MAXPAIRS) break;
+                u16 prev = ht[hr[i]][k];
+                pairs[pindex] = (int)__byte_perm(si[i], prev, 0x1054);
+            }
+        }
+    }
+    __syncthreads();
+
+    u32 plen = min(pairs_len, MAXPAIRS);
+    u32 ii, kk;
+    for (u32 s = atomicAdd(&next_pair, 1); s < plen; s = atomicAdd(&next_pair, 1)) {
+        int pair = pairs[s];
+        ii = __byte_perm(pair, 0, 0x4510);
+        kk = __byte_perm(pair, 0, 0x4532);
+        uint4 li = lastword[ii];
+        uint4 lk = lastword[kk];
+        xors[0] = li.x ^ lk.x;
+        xors[1] = li.y ^ lk.y;
+        xors[2] = li.z ^ lk.z;
+        xors[3] = li.w ^ lk.w;
+        if (xors[3] != 0) {
+            bexor = __byte_perm(xors[0], xors[1], 0x1076);
+            xorbucketid = (bexor >> RB) & BUCKMASK;
+            xorslot = atomicAdd(&eq->edata.nslots[5][xorbucketid], 1);
+            if (xorslot < NSLOTS) {
+                slotsmall& xs = eq->treessmall[2][xorbucketid][xorslot];
+                *(uint4*)(&xs.hash[0]) = make_uint4(xors[1], xors[2], xors[3],
+                                                     pack_bid_s0_s1(bucketid, ii, kk));
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Host launchers
 // ============================================================================
 
@@ -303,6 +780,22 @@ void launch_digit_1(equi_state* device_eq, cudaStream_t stream) {
     constexpr u32 grid_blocks = NBUCKETS;   // 4096 for RB=8 / CONFIG_MODE_2
     constexpr u32 threads_per_block = 512;
     digit_1_kernel<<<grid_blocks, threads_per_block, 0, stream>>>(device_eq);
+}
+
+void launch_digit_2(equi_state* device_eq, cudaStream_t stream) {
+    digit_2_kernel<<<NBUCKETS, THREADS, 0, stream>>>(device_eq);
+}
+
+void launch_digit_3(equi_state* device_eq, cudaStream_t stream) {
+    digit_3_kernel<<<NBUCKETS, THREADS, 0, stream>>>(device_eq);
+}
+
+void launch_digit_4(equi_state* device_eq, cudaStream_t stream) {
+    digit_4_kernel<<<NBUCKETS, THREADS, 0, stream>>>(device_eq);
+}
+
+void launch_digit_5(equi_state* device_eq, cudaStream_t stream) {
+    digit_5_kernel<<<NBUCKETS, THREADS, 0, stream>>>(device_eq);
 }
 
 } // namespace bw

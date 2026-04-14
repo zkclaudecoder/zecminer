@@ -44,6 +44,10 @@ namespace bw {
 // `header` is the prepared blake2b mid-state; `nonce` is full 32-byte nonce.
 void launch_digit_first(equi_state* device_eq, uint32_t nonce, cudaStream_t stream);
 void launch_digit_1(equi_state* device_eq, cudaStream_t stream);
+void launch_digit_2(equi_state* device_eq, cudaStream_t stream);
+void launch_digit_3(equi_state* device_eq, cudaStream_t stream);
+void launch_digit_4(equi_state* device_eq, cudaStream_t stream);
+void launch_digit_5(equi_state* device_eq, cudaStream_t stream);
 
 } // namespace bw
 

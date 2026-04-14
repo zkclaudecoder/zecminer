@@ -2142,32 +2142,35 @@ __host__ void eq_cuda_context<RB, SM, SSM, THREADS, PACKER>::solve(const char *t
 
 	digit_first<RB, SM, PACKER> << <NBLOCKS / FD_THREADS, FD_THREADS >> >(device_eq, nn);
 	digit_1<RB, SM, SSM, PACKER, 4 * NRESTS, 512> << <4096, 512 >> >(device_eq);
+	digit_2<RB, SM, SSM, PACKER, 4 * NRESTS, THREADS> << <blocks, THREADS >> >(device_eq);
+	digit_3<RB, SM, SSM, PACKER, 4 * NRESTS, THREADS> << <blocks, THREADS >> >(device_eq);
 
-	// Phase 0 diagnostic: dump round-1 bucket fill so cuda_blackwell can be
-	// validated against us. Enable with DJEZO_DUMP_ROUND1=1 in env.
+	// Phase 0/1 diagnostic: dump round-1..3 bucket fills for cross-validation
+	// against cuda_blackwell. Enable with DJEZO_DUMP_ROUND1=1 in env.
 	static const bool djezo_dump_r1 = std::getenv("DJEZO_DUMP_ROUND1") != nullptr;
 	if (djezo_dump_r1) {
 		cudaDeviceSynchronize();
-		u32 hnslots[1 << (DIGITBITS - RB)];
-		cudaMemcpy(hnslots, &device_eq->edata.nslots[1], sizeof(hnslots), cudaMemcpyDeviceToHost);
-		u64 total = 0, min_v = ~0ULL, max_v = 0, nonempty = 0;
-		for (u32 i = 0; i < (1u << (DIGITBITS - RB)); ++i) {
-			total += hnslots[i];
-			if (hnslots[i] < min_v) min_v = hnslots[i];
-			if (hnslots[i] > max_v) max_v = hnslots[i];
-			if (hnslots[i] > 0) ++nonempty;
+		constexpr u32 NB = 1u << (DIGITBITS - RB);
+		u32 hnslots[NB];
+		for (int r = 1; r <= 5; ++r) {
+			cudaMemcpy(hnslots, &device_eq->edata.nslots[r], sizeof(hnslots), cudaMemcpyDeviceToHost);
+			u64 total = 0, min_v = ~0ULL, max_v = 0, nonempty = 0;
+			for (u32 i = 0; i < NB; ++i) {
+				total += hnslots[i];
+				if (hnslots[i] < min_v) min_v = hnslots[i];
+				if (hnslots[i] > max_v) max_v = hnslots[i];
+				if (hnslots[i] > 0) ++nonempty;
+			}
+			fprintf(stderr, "[DJEZO] round-%d nslots: total=%llu mean=%.3f min=%llu max=%llu nonempty=%llu/%u\n",
+					r,
+					(unsigned long long)total,
+					(double)total / NB,
+					(unsigned long long)min_v,
+					(unsigned long long)max_v,
+					(unsigned long long)nonempty,
+					NB);
 		}
-		fprintf(stderr, "[DJEZO] round-1 nslots: total=%llu mean=%.3f min=%llu max=%llu nonempty=%llu/%u\n",
-				(unsigned long long)total,
-				(double)total / (1u << (DIGITBITS - RB)),
-				(unsigned long long)min_v,
-				(unsigned long long)max_v,
-				(unsigned long long)nonempty,
-				(1u << (DIGITBITS - RB)));
 	}
-
-	digit_2<RB, SM, SSM, PACKER, 4 * NRESTS, THREADS> << <blocks, THREADS >> >(device_eq);
-	digit_3<RB, SM, SSM, PACKER, 4 * NRESTS, THREADS> << <blocks, THREADS >> >(device_eq);
 
 	if (cancelf()) return;
 

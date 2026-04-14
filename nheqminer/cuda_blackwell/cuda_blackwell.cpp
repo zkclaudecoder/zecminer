@@ -88,28 +88,36 @@ void eq_cuda_context_blackwell::solve(
 
     bw::launch_digit_first(device_eq, /*nonce_suffix=*/0, stream);
     bw::launch_digit_1(device_eq, stream);
+    bw::launch_digit_2(device_eq, stream);
+    bw::launch_digit_3(device_eq, stream);
+    bw::launch_digit_4(device_eq, stream);
+    bw::launch_digit_5(device_eq, stream);
 
     static const bool verbose = std::getenv("DJEZO_BW_VERBOSE") != nullptr;
     if (verbose) {
-        // Pull back the round-1 slot-count array so we can sanity-check the output
-        uint32_t nslots1[bw::NBUCKETS];
-        checkCudaErrorsBW(cudaMemcpyAsync(nslots1, &device_eq->edata.nslots[1],
-                                           sizeof(nslots1), cudaMemcpyDeviceToHost, stream));
+        // Pull back round-1..5 slot-count arrays for sanity checks
+        uint32_t ns[5][bw::NBUCKETS];
+        for (int r = 1; r <= 5; ++r) {
+            checkCudaErrorsBW(cudaMemcpyAsync(ns[r - 1], &device_eq->edata.nslots[r],
+                                               sizeof(ns[r - 1]), cudaMemcpyDeviceToHost, stream));
+        }
         checkCudaErrorsBW(cudaStreamSynchronize(stream));
 
-        uint64_t total = 0, min_v = ~0ULL, max_v = 0, nonempty = 0;
-        for (uint32_t i = 0; i < bw::NBUCKETS; ++i) {
-            total += nslots1[i];
-            if (nslots1[i] < min_v) min_v = nslots1[i];
-            if (nslots1[i] > max_v) max_v = nslots1[i];
-            if (nslots1[i] > 0) ++nonempty;
+        for (int r = 1; r <= 5; ++r) {
+            uint64_t total = 0, min_v = ~0ULL, max_v = 0, nonempty = 0;
+            for (uint32_t i = 0; i < bw::NBUCKETS; ++i) {
+                total += ns[r - 1][i];
+                if (ns[r - 1][i] < min_v) min_v = ns[r - 1][i];
+                if (ns[r - 1][i] > max_v) max_v = ns[r - 1][i];
+                if (ns[r - 1][i] > 0) ++nonempty;
+            }
+            std::cerr << "[BW] round-" << r << " nslots: total=" << total
+                      << " mean=" << (double)total / bw::NBUCKETS
+                      << " min=" << min_v
+                      << " max=" << max_v
+                      << " nonempty=" << nonempty << "/" << bw::NBUCKETS
+                      << std::endl;
         }
-        std::cerr << "[BW] round-1 nslots: total=" << total
-                  << " mean=" << (double)total / bw::NBUCKETS
-                  << " min=" << min_v
-                  << " max=" << max_v
-                  << " nonempty=" << nonempty << "/" << bw::NBUCKETS
-                  << std::endl;
     } else {
         checkCudaErrorsBW(cudaStreamSynchronize(stream));
     }
